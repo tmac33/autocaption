@@ -2,6 +2,7 @@
 import os
 import queue
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -78,6 +79,7 @@ class SubtitleBurnerApp:
         self.custom_crf_var = tk.StringVar(value="")
         self.processing = False
         self.log_queue: queue.Queue[str] = queue.Queue()
+        self.ffmpeg_bin = self._resolve_ffmpeg_bin()
 
         self._build_ui()
         self._tick_logs()
@@ -232,6 +234,12 @@ class SubtitleBurnerApp:
                 "未安装 opencc。请先执行:\n\npip3 install -r requirements.txt",
             )
             return
+        if not self.ffmpeg_bin:
+            messagebox.showerror(
+                "缺少依赖",
+                "未找到 ffmpeg。\n请先安装：brew install ffmpeg",
+            )
+            return
 
         video = self.video_path.get().strip()
         srt = self.srt_path.get().strip()
@@ -341,7 +349,7 @@ class SubtitleBurnerApp:
         )
         vf = f"subtitles='{escaped_srt}':force_style='{style}'"
         cmd = [
-            "ffmpeg",
+            self.ffmpeg_bin,
             "-y",
             "-i",
             video,
@@ -386,6 +394,15 @@ class SubtitleBurnerApp:
         if code != 0:
             raise RuntimeError("ffmpeg 压制失败，请检查字幕编码/视频格式是否可读。")
         self._log(f"ffmpeg 执行完成，用时 {elapsed:.1f}s")
+
+    def _resolve_ffmpeg_bin(self) -> str | None:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            return ffmpeg
+        for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return None
 
     def _reset_ui(self):
         self.processing = False

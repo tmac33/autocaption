@@ -12,6 +12,7 @@
 - macOS
 - Python 3.10+
 - 已安装 `ffmpeg`（你当前环境已安装）
+  - 推荐安装命令：`brew install ffmpeg`
 
 ## 2. 安装依赖
 

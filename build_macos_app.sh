@@ -11,6 +11,7 @@ RES_DIR="$CONTENTS_DIR/Resources"
 mkdir -p "$MACOS_DIR" "$RES_DIR"
 
 cp "$ROOT_DIR/app.py" "$RES_DIR/app.py"
+cp "$ROOT_DIR/assets/app.icns" "$RES_DIR/app.icns"
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -26,6 +27,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
   <string>com.autocaption.tradsubtitleburner</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
+  <key>CFBundleIconFile</key>
+  <string>app.icns</string>
   <key>CFBundleName</key>
   <string>TradSubtitleBurner</string>
   <key>CFBundlePackageType</key>
@@ -48,6 +51,7 @@ set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 RES_DIR="$(cd "$SELF_DIR/../Resources" && pwd)"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
 if command -v /usr/local/bin/python3 >/dev/null 2>&1; then
   PY_BIN="/usr/local/bin/python3"
