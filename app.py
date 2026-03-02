@@ -57,6 +57,11 @@ YOUTUBE_ENCODING_PROFILES = {
     },
 }
 ASR_MODEL_LABEL_TO_KEY = {"快速（small）": "small", "平衡（medium）": "medium"}
+TIMELINE_EARLY_SHOW_SEC = 0.08
+TIMELINE_EARLY_HIDE_SEC = 0.03
+TIMELINE_GAP_BEFORE_NEXT_SEC = 0.05
+TIMELINE_MIN_DURATION_SEC = 0.15
+TIMELINE_MIN_DURATION_FALLBACK_SEC = 0.25
 
 
 def parse_drop_files(raw: str) -> list[str]:
@@ -85,6 +90,7 @@ class SubtitleBurnerApp:
         self.quality_mode_label = tk.StringVar(value="极致画质")
         self.custom_crf_var = tk.StringVar(value="")
         self.auto_asr_var = tk.BooleanVar(value=False)
+        self.align_timeline_var = tk.BooleanVar(value=False)
         self.asr_model_label = tk.StringVar(value="快速（small）")
         self.processing = False
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -138,6 +144,11 @@ class SubtitleBurnerApp:
             text="无SRT时自动识别简体中文语音",
             variable=self.auto_asr_var,
         ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(
+            asr_row,
+            text="有SRT时用自动时间轴校准文字",
+            variable=self.align_timeline_var,
+        ).pack(side=tk.LEFT, padx=(12, 0))
 
         asr_model_row = ttk.Frame(frame)
         asr_model_row.pack(fill=tk.X, pady=4)
@@ -281,6 +292,7 @@ class SubtitleBurnerApp:
         asr_model_label = self.asr_model_label.get().strip() or "快速（small）"
         asr_model_key = ASR_MODEL_LABEL_TO_KEY.get(asr_model_label, "small")
         auto_asr = self.auto_asr_var.get()
+        align_timeline = self.align_timeline_var.get()
         custom_crf_raw = self.custom_crf_var.get().strip()
         custom_crf: str | None = None
 
@@ -293,7 +305,8 @@ class SubtitleBurnerApp:
         if not srt and not auto_asr:
             messagebox.showerror("参数错误", "请提供 SRT，或启用“自动拾取字幕”。")
             return
-        if not srt and auto_asr and WhisperModel is None:
+        need_asr = (not srt and auto_asr) or (bool(srt) and align_timeline)
+        if need_asr and WhisperModel is None:
             messagebox.showerror(
                 "缺少依赖",
                 "未安装 faster-whisper。\n"
@@ -330,6 +343,7 @@ class SubtitleBurnerApp:
                 quality_mode_key,
                 custom_crf,
                 auto_asr,
+                align_timeline,
                 asr_model_key,
             ),
             daemon=True,
@@ -345,16 +359,25 @@ class SubtitleBurnerApp:
         quality_mode_key: str,
         custom_crf: str | None,
         auto_asr: bool,
+        align_timeline: bool,
         asr_model_key: str,
     ):
         tmpdir = tempfile.mkdtemp(prefix="trad_hardsub_")
         src_srt = os.path.join(tmpdir, "subtitle_src.srt")
+        asr_srt = os.path.join(tmpdir, "subtitle_asr.srt")
+        aligned_srt = os.path.join(tmpdir, "subtitle_aligned.srt")
         trad_srt = os.path.join(tmpdir, "subtitle_trad.srt")
 
         try:
             if srt and os.path.isfile(srt):
                 src_srt = srt
-                if auto_asr:
+                if align_timeline:
+                    self._log("开始：自动拾取语音时间轴（用于校准提供的SRT文字）")
+                    self._transcribe_video_to_srt(video, asr_srt, asr_model_key)
+                    self._align_srt_timeline_by_asr(src_srt, asr_srt, aligned_srt)
+                    src_srt = aligned_srt
+                    self._log(f"已使用自动时间轴校准字幕: {src_srt}")
+                elif auto_asr:
                     self._log("检测到已提供SRT，自动拾取已跳过。")
             else:
                 self._log("开始：自动拾取简体中文字幕（语音识别）")
@@ -482,6 +505,118 @@ class SubtitleBurnerApp:
             raise RuntimeError("自动拾取未生成有效字幕，请检查视频语音是否清晰。")
         self._log(f"自动拾取完成，共 {count} 条字幕。")
 
+    def _align_srt_timeline_by_asr(self, text_srt: str, asr_srt: str, dst_srt: str):
+        text_entries = self._parse_srt_entries(text_srt)
+        asr_entries = self._parse_srt_entries(asr_srt)
+        if not text_entries:
+            raise RuntimeError("提供的SRT没有可用字幕内容。")
+        if not asr_entries:
+            raise RuntimeError("自动拾取未生成可用时间轴，无法校准。")
+
+        t_count = len(text_entries)
+        a_count = len(asr_entries)
+        self._log(f"校准时间轴：原字幕 {t_count} 条，自动时间轴 {a_count} 条")
+
+        # Use text-length pace mapping instead of plain index mapping.
+        # This gives earlier/later timing in proportion to speech density.
+        asr_counts = [max(1, self._effective_text_len(x["text"])) for x in asr_entries]
+        text_counts = [max(1, self._effective_text_len(x["text"])) for x in text_entries]
+
+        asr_total = sum(asr_counts)
+        text_total = sum(text_counts)
+        asr_start = asr_entries[0]["start"]
+        asr_end = asr_entries[-1]["end"]
+        asr_span = max(0.5, asr_end - asr_start)
+
+        cum_asr = [0]
+        for n in asr_counts:
+            cum_asr.append(cum_asr[-1] + n)
+
+        def asr_ratio_to_time(ratio: float) -> float:
+            target = ratio * asr_total
+            for i in range(1, len(cum_asr)):
+                if target <= cum_asr[i]:
+                    seg_chars = max(1, cum_asr[i] - cum_asr[i - 1])
+                    local = (target - cum_asr[i - 1]) / seg_chars
+                    s = asr_entries[i - 1]["start"]
+                    e = asr_entries[i - 1]["end"]
+                    return s + (e - s) * local
+            return asr_end
+
+        aligned = []
+        run = 0
+        for i, ent in enumerate(text_entries):
+            start_ratio = run / text_total
+            run += text_counts[i]
+            end_ratio = run / text_total
+
+            start_sec = asr_ratio_to_time(start_ratio)
+            end_sec = asr_ratio_to_time(end_ratio)
+
+            # Show slightly earlier, hide slightly earlier to reduce lingering.
+            start_sec = max(asr_start, start_sec - TIMELINE_EARLY_SHOW_SEC)
+            end_sec = min(asr_end, end_sec - TIMELINE_EARLY_HIDE_SEC)
+            if end_sec <= start_sec:
+                end_sec = min(asr_end, start_sec + TIMELINE_MIN_DURATION_FALLBACK_SEC)
+
+            aligned.append({"start": start_sec, "end": end_sec, "text": ent["text"]})
+
+        # Enforce no overlap and timely disappear before next line.
+        for i in range(len(aligned) - 1):
+            max_end = aligned[i + 1]["start"] - TIMELINE_GAP_BEFORE_NEXT_SEC
+            if aligned[i]["end"] > max_end:
+                aligned[i]["end"] = max_end
+            if aligned[i]["end"] <= aligned[i]["start"]:
+                aligned[i]["end"] = aligned[i]["start"] + TIMELINE_MIN_DURATION_SEC
+        for i in range(len(aligned)):
+            if i > 0 and aligned[i]["start"] < aligned[i - 1]["end"]:
+                aligned[i]["start"] = aligned[i - 1]["end"] + 0.02
+            if aligned[i]["end"] <= aligned[i]["start"]:
+                aligned[i]["end"] = aligned[i]["start"] + TIMELINE_MIN_DURATION_SEC
+            aligned[i]["end"] = min(aligned[i]["end"], asr_start + asr_span)
+
+        self._write_srt_entries(dst_srt, aligned)
+
+    def _parse_srt_entries(self, srt_path: str) -> list[dict]:
+        with open(srt_path, "r", encoding="utf-8-sig", errors="ignore") as f:
+            raw = f.read().strip()
+        if not raw:
+            return []
+        blocks = re.split(r"\n\s*\n", raw)
+        entries = []
+        for block in blocks:
+            lines = [ln.rstrip() for ln in block.splitlines() if ln.strip() != ""]
+            if len(lines) < 2:
+                continue
+            timeline_line = lines[1] if "-->" in lines[1] else lines[0]
+            if "-->" not in timeline_line:
+                continue
+            parts = [x.strip() for x in timeline_line.split("-->")]
+            if len(parts) != 2:
+                continue
+            start = self._parse_srt_timestamp(parts[0])
+            end = self._parse_srt_timestamp(parts[1])
+            if end <= start:
+                continue
+            text_lines = lines[2:] if "-->" in lines[1] else lines[1:]
+            text = "\n".join(text_lines).strip()
+            if not text:
+                continue
+            entries.append({"start": start, "end": end, "text": text})
+        return entries
+
+    def _write_srt_entries(self, srt_path: str, entries: list[dict]):
+        with open(srt_path, "w", encoding="utf-8") as f:
+            for idx, ent in enumerate(entries, start=1):
+                start = self._format_srt_timestamp(ent["start"])
+                end = self._format_srt_timestamp(ent["end"])
+                f.write(f"{idx}\n{start} --> {end}\n{ent['text']}\n\n")
+
+    def _effective_text_len(self, text: str) -> int:
+        cleaned = re.sub(r"\s+", "", text)
+        cleaned = re.sub(r"[，。！？、；：,.!?;:\"'“”‘’（）()\\[\\]{}<>《》-]", "", cleaned)
+        return len(cleaned)
+
     def _format_srt_timestamp(self, seconds: float) -> str:
         total_ms = max(0, int(round(seconds * 1000)))
         hours = total_ms // 3600000
@@ -491,6 +626,16 @@ class SubtitleBurnerApp:
         secs = total_ms // 1000
         ms = total_ms % 1000
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+    def _parse_srt_timestamp(self, ts: str) -> float:
+        m = re.match(r"^(\d{2}):(\d{2}):(\d{2})[,.](\d{1,3})$", ts.strip())
+        if not m:
+            raise RuntimeError(f"无效SRT时间戳: {ts}")
+        h = int(m.group(1))
+        minute = int(m.group(2))
+        sec = int(m.group(3))
+        ms = int(m.group(4).ljust(3, "0"))
+        return h * 3600 + minute * 60 + sec + ms / 1000.0
 
     def _resolve_ffmpeg_bin(self) -> str | None:
         ffmpeg = shutil.which("ffmpeg")
