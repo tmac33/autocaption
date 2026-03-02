@@ -51,9 +51,16 @@ set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 RES_DIR="$(cd "$SELF_DIR/../Resources" && pwd)"
+PROJECT_DIR_FALLBACK="__PROJECT_ROOT__"
+PROJECT_DIR="$(cd "$SELF_DIR/../../../.." && pwd)"
+if [ ! -x "$PROJECT_DIR/.venv/bin/python" ] && [ -x "$PROJECT_DIR_FALLBACK/.venv/bin/python" ]; then
+  PROJECT_DIR="$PROJECT_DIR_FALLBACK"
+fi
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
-if command -v /usr/local/bin/python3 >/dev/null 2>&1; then
+if [ -x "$PROJECT_DIR/.venv/bin/python" ]; then
+  PY_BIN="$PROJECT_DIR/.venv/bin/python"
+elif command -v /usr/local/bin/python3 >/dev/null 2>&1; then
   PY_BIN="/usr/local/bin/python3"
 elif command -v /opt/homebrew/bin/python3 >/dev/null 2>&1; then
   PY_BIN="/opt/homebrew/bin/python3"
@@ -63,16 +70,18 @@ fi
 
 if ! "$PY_BIN" - <<'PY' >/dev/null 2>&1
 import importlib.util
-mods = ["opencc", "tkinterdnd2"]
+mods = ["opencc", "tkinterdnd2", "faster_whisper"]
 raise SystemExit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)
 PY
 then
-  /usr/bin/osascript -e 'display alert "依赖缺失" message "请先执行: pip3 install -r requirements.txt" as warning'
+  /usr/bin/osascript -e 'display alert "依赖缺失" message "请先执行: pip3 install -r requirements.txt（或 .venv/bin/pip install -r requirements.txt）" as warning'
   exit 1
 fi
 
 exec "$PY_BIN" "$RES_DIR/app.py"
 LAUNCHER
+
+sed -i '' "s|__PROJECT_ROOT__|$ROOT_DIR|g" "$MACOS_DIR/$APP_NAME"
 
 chmod +x "$MACOS_DIR/$APP_NAME"
 

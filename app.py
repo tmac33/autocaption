@@ -4,6 +4,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,6 +22,11 @@ try:
 except ImportError:
     TkinterDnD = None
     DND_FILES = None
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
 
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm"}
@@ -50,6 +56,7 @@ YOUTUBE_ENCODING_PROFILES = {
         "bufsize": "16M",
     },
 }
+ASR_MODEL_LABEL_TO_KEY = {"快速（small）": "small", "平衡（medium）": "medium"}
 
 
 def parse_drop_files(raw: str) -> list[str]:
@@ -77,6 +84,8 @@ class SubtitleBurnerApp:
         self.subtitle_size_label = tk.StringVar(value="中")
         self.quality_mode_label = tk.StringVar(value="极致画质")
         self.custom_crf_var = tk.StringVar(value="")
+        self.auto_asr_var = tk.BooleanVar(value=False)
+        self.asr_model_label = tk.StringVar(value="快速（small）")
         self.processing = False
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.ffmpeg_bin = self._resolve_ffmpeg_bin()
@@ -118,8 +127,29 @@ class SubtitleBurnerApp:
             self.drop_area.dnd_bind("<<Drop>>", self._on_drop)
 
         self._row_file(frame, "视频文件", self.video_path, self._pick_video)
-        self._row_file(frame, "字幕文件（简体SRT）", self.srt_path, self._pick_srt)
+        self._row_file(frame, "字幕文件（简体SRT，可选）", self.srt_path, self._pick_srt)
         self._row_file(frame, "输出文件（建议 .mp4）", self.output_path, self._pick_output)
+
+        asr_row = ttk.Frame(frame)
+        asr_row.pack(fill=tk.X, pady=4)
+        ttk.Label(asr_row, text="自动拾取字幕", width=18).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            asr_row,
+            text="无SRT时自动识别简体中文语音",
+            variable=self.auto_asr_var,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        asr_model_row = ttk.Frame(frame)
+        asr_model_row.pack(fill=tk.X, pady=4)
+        ttk.Label(asr_model_row, text="识别模型", width=18).pack(side=tk.LEFT)
+        asr_model_combo = ttk.Combobox(
+            asr_model_row,
+            textvariable=self.asr_model_label,
+            values=["快速（small）", "平衡（medium）"],
+            state="readonly",
+            width=12,
+        )
+        asr_model_combo.pack(side=tk.LEFT, padx=(8, 0))
 
         size_row = ttk.Frame(frame)
         size_row.pack(fill=tk.X, pady=4)
@@ -248,14 +278,30 @@ class SubtitleBurnerApp:
         subtitle_size_key = SUBTITLE_SIZE_LABEL_TO_KEY.get(size_label, "medium")
         quality_label = self.quality_mode_label.get().strip() or "极致画质"
         quality_mode_key = QUALITY_LABEL_TO_KEY.get(quality_label, "quality")
+        asr_model_label = self.asr_model_label.get().strip() or "快速（small）"
+        asr_model_key = ASR_MODEL_LABEL_TO_KEY.get(asr_model_label, "small")
+        auto_asr = self.auto_asr_var.get()
         custom_crf_raw = self.custom_crf_var.get().strip()
         custom_crf: str | None = None
 
         if not video or not os.path.isfile(video):
             messagebox.showerror("参数错误", "请选择有效视频文件。")
             return
-        if not srt or not os.path.isfile(srt):
+        if srt and not os.path.isfile(srt):
             messagebox.showerror("参数错误", "请选择有效 SRT 文件。")
+            return
+        if not srt and not auto_asr:
+            messagebox.showerror("参数错误", "请提供 SRT，或启用“自动拾取字幕”。")
+            return
+        if not srt and auto_asr and WhisperModel is None:
+            messagebox.showerror(
+                "缺少依赖",
+                "未安装 faster-whisper。\n"
+                f"当前Python: {sys.executable}\n\n"
+                "请先执行:\n"
+                "1) .venv/bin/pip install -r requirements.txt\n"
+                "2) 重新执行 bash build_macos_app.sh",
+            )
             return
         if not output:
             messagebox.showerror("参数错误", "请选择输出路径。")
@@ -276,7 +322,16 @@ class SubtitleBurnerApp:
 
         t = threading.Thread(
             target=self._run_pipeline,
-            args=(video, srt, output, subtitle_size_key, quality_mode_key, custom_crf),
+            args=(
+                video,
+                srt,
+                output,
+                subtitle_size_key,
+                quality_mode_key,
+                custom_crf,
+                auto_asr,
+                asr_model_key,
+            ),
             daemon=True,
         )
         t.start()
@@ -289,13 +344,24 @@ class SubtitleBurnerApp:
         subtitle_size_key: str,
         quality_mode_key: str,
         custom_crf: str | None,
+        auto_asr: bool,
+        asr_model_key: str,
     ):
         tmpdir = tempfile.mkdtemp(prefix="trad_hardsub_")
+        src_srt = os.path.join(tmpdir, "subtitle_src.srt")
         trad_srt = os.path.join(tmpdir, "subtitle_trad.srt")
 
         try:
+            if srt and os.path.isfile(srt):
+                src_srt = srt
+                if auto_asr:
+                    self._log("检测到已提供SRT，自动拾取已跳过。")
+            else:
+                self._log("开始：自动拾取简体中文字幕（语音识别）")
+                self._transcribe_video_to_srt(video, src_srt, asr_model_key)
+                self._log(f"自动字幕已生成: {src_srt}")
             self._log("开始：简体字幕 -> 繁体字幕")
-            self._convert_to_trad(srt, trad_srt)
+            self._convert_to_trad(src_srt, trad_srt)
             self._log(f"繁体字幕已生成: {trad_srt}")
             self._log("开始：YouTube 硬字幕压制（H.264）")
             self._burn_subtitle_youtube(
@@ -394,6 +460,37 @@ class SubtitleBurnerApp:
         if code != 0:
             raise RuntimeError("ffmpeg 压制失败，请检查字幕编码/视频格式是否可读。")
         self._log(f"ffmpeg 执行完成，用时 {elapsed:.1f}s")
+
+    def _transcribe_video_to_srt(self, video: str, dst_srt: str, model_size: str):
+        if WhisperModel is None:
+            raise RuntimeError("缺少 faster-whisper 依赖，无法自动拾取字幕。")
+        self._log(f"加载识别模型: {model_size}（首次使用可能会下载模型，耗时较长）")
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        segments, _info = model.transcribe(video, language="zh", vad_filter=True, beam_size=5)
+
+        count = 0
+        with open(dst_srt, "w", encoding="utf-8") as f:
+            for seg in segments:
+                text = (seg.text or "").strip()
+                if not text:
+                    continue
+                start = self._format_srt_timestamp(seg.start)
+                end = self._format_srt_timestamp(seg.end)
+                count += 1
+                f.write(f"{count}\n{start} --> {end}\n{text}\n\n")
+        if count == 0:
+            raise RuntimeError("自动拾取未生成有效字幕，请检查视频语音是否清晰。")
+        self._log(f"自动拾取完成，共 {count} 条字幕。")
+
+    def _format_srt_timestamp(self, seconds: float) -> str:
+        total_ms = max(0, int(round(seconds * 1000)))
+        hours = total_ms // 3600000
+        total_ms %= 3600000
+        minutes = total_ms // 60000
+        total_ms %= 60000
+        secs = total_ms // 1000
+        ms = total_ms % 1000
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
 
     def _resolve_ffmpeg_bin(self) -> str | None:
         ffmpeg = shutil.which("ffmpeg")
