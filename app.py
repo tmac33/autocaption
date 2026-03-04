@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -95,6 +96,8 @@ class SubtitleBurnerApp:
         self.processing = False
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.ffmpeg_bin = self._resolve_ffmpeg_bin()
+        self.whisper_models: dict[str, WhisperModel] = {}
+        self.whisper_model_lock = threading.Lock()
 
         self._build_ui()
         self._tick_logs()
@@ -487,8 +490,7 @@ class SubtitleBurnerApp:
     def _transcribe_video_to_srt(self, video: str, dst_srt: str, model_size: str):
         if WhisperModel is None:
             raise RuntimeError("缺少 faster-whisper 依赖，无法自动拾取字幕。")
-        self._log(f"加载识别模型: {model_size}（首次使用可能会下载模型，耗时较长）")
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        model = self._get_whisper_model(model_size)
         segments, _info = model.transcribe(video, language="zh", vad_filter=True, beam_size=5)
 
         count = 0
@@ -504,6 +506,30 @@ class SubtitleBurnerApp:
         if count == 0:
             raise RuntimeError("自动拾取未生成有效字幕，请检查视频语音是否清晰。")
         self._log(f"自动拾取完成，共 {count} 条字幕。")
+
+    def _get_whisper_model(self, model_size: str) -> WhisperModel:
+        if WhisperModel is None:
+            raise RuntimeError("缺少 faster-whisper 依赖。")
+        with self.whisper_model_lock:
+            cached = self.whisper_models.get(model_size)
+            if cached is not None:
+                self._log(f"识别模型命中缓存: {model_size}")
+                return cached
+            cpu_threads = max(1, min((os.cpu_count() or 4), 8))
+            num_workers = max(1, min(cpu_threads // 2, 4))
+            self._log(
+                f"加载识别模型: {model_size}（首次使用可能会下载模型）"
+                f" cpu_threads={cpu_threads} num_workers={num_workers}"
+            )
+            model = WhisperModel(
+                model_size,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=cpu_threads,
+                num_workers=num_workers,
+            )
+            self.whisper_models[model_size] = model
+            return model
 
     def _align_srt_timeline_by_asr(self, text_srt: str, asr_srt: str, dst_srt: str):
         text_entries = self._parse_srt_entries(text_srt)
@@ -665,7 +691,8 @@ class SubtitleBurnerApp:
         self.root.after(120, self._tick_logs)
 
     def _log(self, msg: str):
-        self.log_queue.put(msg)
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_queue.put(f"[{ts}] {msg}")
 
 
 def main():
