@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import queue
 import re
@@ -34,8 +35,23 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm"}
 SUB_EXTS = {".srt"}
 SUBTITLE_SIZE_MAP = {"small": 18, "medium": 24, "large": 30}
 SUBTITLE_SIZE_LABEL_TO_KEY = {"小": "small", "中": "medium", "大": "large"}
-QUALITY_LABEL_TO_KEY = {"极致画质": "quality", "体积优先": "size"}
+QUALITY_LABEL_TO_KEY = {
+    "匹配源参数（快速推流）": "match",
+    "极致画质": "quality",
+    "体积优先": "size",
+}
 YOUTUBE_ENCODING_PROFILES = {
+    "match": {
+        "video_codec": "libx264",
+        "preset": "medium",
+        "pix_fmt": "yuv420p",
+        "audio_codec": "aac",
+        "audio_bitrate_fallback": "128k",
+        "video_bitrate_min": 800_000,
+        "video_bitrate_max": 20_000_000,
+        "audio_bitrate_min": 96_000,
+        "audio_bitrate_max": 192_000,
+    },
     "quality": {
         "video_codec": "libx264",
         "crf": "17",
@@ -88,7 +104,7 @@ class SubtitleBurnerApp:
         self.srt_path = tk.StringVar()
         self.output_path = tk.StringVar()
         self.subtitle_size_label = tk.StringVar(value="中")
-        self.quality_mode_label = tk.StringVar(value="极致画质")
+        self.quality_mode_label = tk.StringVar(value="匹配源参数（快速推流）")
         self.custom_crf_var = tk.StringVar(value="")
         self.auto_asr_var = tk.BooleanVar(value=False)
         self.align_timeline_var = tk.BooleanVar(value=False)
@@ -96,10 +112,12 @@ class SubtitleBurnerApp:
         self.processing = False
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.ffmpeg_bin = self._resolve_ffmpeg_bin()
+        self.ffprobe_bin = self._resolve_ffprobe_bin()
         self.whisper_models: dict[str, WhisperModel] = {}
         self.whisper_model_lock = threading.Lock()
 
         self._build_ui()
+        self.quality_mode_label.trace_add("write", self._on_quality_mode_changed)
         self._tick_logs()
 
     def _build_ui(self) -> None:
@@ -183,24 +201,25 @@ class SubtitleBurnerApp:
         quality_combo = ttk.Combobox(
             quality_row,
             textvariable=self.quality_mode_label,
-            values=["极致画质", "体积优先"],
+            values=["匹配源参数（快速推流）", "极致画质", "体积优先"],
             state="readonly",
-            width=10,
+            width=24,
         )
         quality_combo.pack(side=tk.LEFT, padx=(8, 0))
 
         crf_row = ttk.Frame(frame)
         crf_row.pack(fill=tk.X, pady=4)
         ttk.Label(crf_row, text="自定义CRF（可选）", width=18).pack(side=tk.LEFT)
-        crf_entry = ttk.Entry(crf_row, textvariable=self.custom_crf_var, width=12)
-        crf_entry.pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(crf_row, text="留空使用画质模式预设；范围建议 17-23").pack(side=tk.LEFT, padx=8)
+        self.crf_entry = ttk.Entry(crf_row, textvariable=self.custom_crf_var, width=12)
+        self.crf_entry.pack(side=tk.LEFT, padx=(8, 0))
+        self.crf_hint_label = ttk.Label(crf_row, text="留空使用画质模式预设；范围建议 17-23")
+        self.crf_hint_label.pack(side=tk.LEFT, padx=8)
 
         options = ttk.Frame(frame)
         options.pack(fill=tk.X, pady=8)
         ttk.Label(
             options,
-            text="编码策略：H.264 硬字幕（极致画质/体积优先），适合 YouTube 发布",
+            text="编码策略：默认匹配源参数（快速推流）+ H.264 硬字幕，适合 YouTube 发布",
         ).pack(anchor="w")
 
         btns = ttk.Frame(frame)
@@ -214,6 +233,17 @@ class SubtitleBurnerApp:
 
         self.log_box = tk.Text(frame, height=14, wrap=tk.WORD)
         self.log_box.pack(fill=tk.BOTH, expand=True)
+        self._on_quality_mode_changed()
+
+    def _on_quality_mode_changed(self, *_args):
+        label = self.quality_mode_label.get().strip() or "匹配源参数（快速推流）"
+        mode = QUALITY_LABEL_TO_KEY.get(label, "match")
+        if mode == "match":
+            self.crf_entry.configure(state=tk.DISABLED)
+            self.crf_hint_label.configure(text="匹配源参数模式下 CRF 不生效（按源视频码率）")
+        else:
+            self.crf_entry.configure(state=tk.NORMAL)
+            self.crf_hint_label.configure(text="留空使用画质模式预设；范围建议 17-23")
 
     def _row_file(self, parent, label, var, callback):
         row = ttk.Frame(parent)
@@ -290,8 +320,8 @@ class SubtitleBurnerApp:
         output = self.output_path.get().strip()
         size_label = self.subtitle_size_label.get().strip() or "中"
         subtitle_size_key = SUBTITLE_SIZE_LABEL_TO_KEY.get(size_label, "medium")
-        quality_label = self.quality_mode_label.get().strip() or "极致画质"
-        quality_mode_key = QUALITY_LABEL_TO_KEY.get(quality_label, "quality")
+        quality_label = self.quality_mode_label.get().strip() or "匹配源参数（快速推流）"
+        quality_mode_key = QUALITY_LABEL_TO_KEY.get(quality_label, "match")
         asr_model_label = self.asr_model_label.get().strip() or "快速（small）"
         asr_model_key = ASR_MODEL_LABEL_TO_KEY.get(asr_model_label, "small")
         auto_asr = self.auto_asr_var.get()
@@ -322,7 +352,7 @@ class SubtitleBurnerApp:
         if not output:
             messagebox.showerror("参数错误", "请选择输出路径。")
             return
-        if custom_crf_raw:
+        if custom_crf_raw and quality_mode_key != "match":
             if not custom_crf_raw.isdigit():
                 messagebox.showerror("参数错误", "自定义CRF必须是整数（建议17-23）。")
                 return
@@ -331,6 +361,8 @@ class SubtitleBurnerApp:
                 messagebox.showerror("参数错误", "自定义CRF范围应为 0-51。")
                 return
             custom_crf = str(crf_int)
+        elif custom_crf_raw and quality_mode_key == "match":
+            self._log("提示：匹配源参数模式下，已忽略自定义CRF。")
 
         self.processing = True
         self.start_btn.configure(state=tk.DISABLED)
@@ -427,7 +459,6 @@ class SubtitleBurnerApp:
         trad_srt = os.path.abspath(trad_srt)
         output = os.path.abspath(output)
         encoding = YOUTUBE_ENCODING_PROFILES.get(quality_mode_key, YOUTUBE_ENCODING_PROFILES["quality"])
-        effective_crf = custom_crf or encoding["crf"]
 
         font_size = SUBTITLE_SIZE_MAP.get(subtitle_size_key, 24)
         style = (
@@ -449,24 +480,70 @@ class SubtitleBurnerApp:
             vf,
             "-c:v",
             encoding["video_codec"],
-            "-crf",
-            effective_crf,
             "-preset",
             encoding["preset"],
             "-pix_fmt",
             encoding["pix_fmt"],
             "-c:a",
             encoding["audio_codec"],
-            "-b:a",
-            encoding["audio_bitrate"],
         ]
-        if encoding["maxrate"] and encoding["bufsize"]:
-            cmd.extend(["-maxrate", encoding["maxrate"], "-bufsize", encoding["bufsize"]])
+        if quality_mode_key == "match":
+            matched = self._probe_source_media(video)
+            if matched:
+                video_bitrate = matched["video_bitrate"]
+                audio_bitrate = matched["audio_bitrate"]
+                fps = matched["fps"]
+                gop = max(24, int(round(fps * 2)))
+                self._log(
+                    "源参数探测："
+                    f"{matched['width']}x{matched['height']} fps={fps:.3f} "
+                    f"v={self._format_bitrate(video_bitrate)} a={self._format_bitrate(audio_bitrate)}"
+                )
+                cmd.extend(
+                    [
+                        "-b:v",
+                        self._to_ffmpeg_bitrate_k(video_bitrate),
+                        "-maxrate",
+                        self._to_ffmpeg_bitrate_k(video_bitrate),
+                        "-bufsize",
+                        self._to_ffmpeg_bitrate_k(video_bitrate * 2),
+                        "-g",
+                        str(gop),
+                        "-keyint_min",
+                        str(gop),
+                        "-sc_threshold",
+                        "0",
+                        "-b:a",
+                        self._to_ffmpeg_bitrate_k(audio_bitrate),
+                        "-movflags",
+                        "+faststart",
+                    ]
+                )
+                self._log(
+                    "编码参数：模式=match "
+                    f"b:v={self._to_ffmpeg_bitrate_k(video_bitrate)} "
+                    f"maxrate={self._to_ffmpeg_bitrate_k(video_bitrate)} "
+                    f"bufsize={self._to_ffmpeg_bitrate_k(video_bitrate * 2)} "
+                    f"gop={gop} b:a={self._to_ffmpeg_bitrate_k(audio_bitrate)}"
+                )
+            else:
+                self._log("匹配源参数失败：缺少 ffprobe 或关键字段，已回退极致画质模式。")
+                quality_mode_key = "quality"
+                encoding = YOUTUBE_ENCODING_PROFILES["quality"]
+                effective_crf = custom_crf or encoding["crf"]
+                cmd.extend(["-crf", effective_crf, "-b:a", encoding["audio_bitrate"]])
+                self._log(f"编码参数：模式={quality_mode_key} CRF={effective_crf}")
+        else:
+            effective_crf = custom_crf or encoding["crf"]
+            cmd.extend(["-crf", effective_crf, "-b:a", encoding["audio_bitrate"]])
+            if encoding["maxrate"] and encoding["bufsize"]:
+                cmd.extend(["-maxrate", encoding["maxrate"], "-bufsize", encoding["bufsize"]])
+            self._log(
+                f"编码参数：模式={quality_mode_key} CRF={effective_crf}"
+                + (f" maxrate={encoding['maxrate']}" if encoding["maxrate"] else "")
+            )
         cmd.append(output)
-        self._log(
-            f"编码参数：模式={quality_mode_key} CRF={effective_crf}"
-            + (f" maxrate={encoding['maxrate']}" if encoding["maxrate"] else "")
-        )
+        self._log("ffmpeg 命令已构建（已省略长参数）")
 
         start = time.time()
         proc = subprocess.Popen(
@@ -671,6 +748,124 @@ class SubtitleBurnerApp:
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                 return candidate
         return None
+
+    def _resolve_ffprobe_bin(self) -> str | None:
+        ffprobe = shutil.which("ffprobe")
+        if ffprobe:
+            return ffprobe
+        for candidate in ("/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe"):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+
+    def _probe_source_media(self, video: str) -> dict | None:
+        if not self.ffprobe_bin:
+            return None
+        cmd = [
+            self.ffprobe_bin,
+            "-v",
+            "error",
+            "-show_entries",
+            (
+                "format=bit_rate:"
+                "stream=index,codec_type,bit_rate,avg_frame_rate,r_frame_rate,width,height,"
+                "pix_fmt,profile,level,sample_rate,channels,codec_name"
+            ),
+            "-of",
+            "json",
+            video,
+        ]
+        try:
+            raw = subprocess.check_output(cmd, text=True)
+            data = json.loads(raw)
+        except Exception:
+            return None
+        streams = data.get("streams") or []
+        fmt = data.get("format") or {}
+        video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+        audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+        if not video_stream:
+            return None
+
+        match_cfg = YOUTUBE_ENCODING_PROFILES["match"]
+        format_bitrate = self._safe_int(fmt.get("bit_rate"))
+        video_bitrate = self._clamp_int(
+            self._safe_int(video_stream.get("bit_rate")) or format_bitrate,
+            match_cfg["video_bitrate_min"],
+            match_cfg["video_bitrate_max"],
+        )
+        if video_bitrate is None:
+            return None
+        fps = self._parse_fps(video_stream.get("avg_frame_rate")) or self._parse_fps(
+            video_stream.get("r_frame_rate")
+        )
+        if fps is None:
+            fps = 25.0
+
+        source_audio_bitrate = self._safe_int(audio_stream.get("bit_rate")) if audio_stream else None
+        audio_bitrate = self._clamp_int(
+            source_audio_bitrate,
+            match_cfg["audio_bitrate_min"],
+            match_cfg["audio_bitrate_max"],
+        )
+        if audio_bitrate is None:
+            audio_bitrate = self._parse_k_bitrate(match_cfg["audio_bitrate_fallback"])
+
+        return {
+            "width": int(video_stream.get("width") or 0),
+            "height": int(video_stream.get("height") or 0),
+            "fps": fps,
+            "video_bitrate": video_bitrate,
+            "audio_bitrate": audio_bitrate,
+            "pix_fmt": video_stream.get("pix_fmt") or "",
+            "profile": video_stream.get("profile") or "",
+            "level": video_stream.get("level") or "",
+        }
+
+    def _safe_int(self, value) -> int | None:
+        try:
+            if value is None:
+                return None
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _clamp_int(self, value: int | None, minimum: int, maximum: int) -> int | None:
+        if value is None:
+            return None
+        if value < minimum:
+            return minimum
+        if value > maximum:
+            return maximum
+        return value
+
+    def _parse_fps(self, raw: str | None) -> float | None:
+        if not raw:
+            return None
+        if "/" in raw:
+            parts = raw.split("/", 1)
+            den = self._safe_int(parts[1])
+            num = self._safe_int(parts[0])
+            if not den or not num:
+                return None
+            return num / den
+        val = self._safe_int(raw)
+        if val is None:
+            return None
+        return float(val)
+
+    def _parse_k_bitrate(self, raw: str) -> int:
+        m = re.match(r"^(\d+)k$", raw.strip().lower())
+        if not m:
+            return 128_000
+        return int(m.group(1)) * 1000
+
+    def _to_ffmpeg_bitrate_k(self, bps: int) -> str:
+        kbps = max(1, int(round(bps / 1000)))
+        return f"{kbps}k"
+
+    def _format_bitrate(self, bps: int) -> str:
+        return self._to_ffmpeg_bitrate_k(bps)
 
     def _reset_ui(self):
         self.processing = False
