@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import math
 import os
 import queue
 import re
@@ -27,8 +28,10 @@ except ImportError:
 
 try:
     from faster_whisper import WhisperModel
+    from faster_whisper.utils import download_model as whisper_download_model
 except ImportError:
     WhisperModel = None
+    whisper_download_model = None
 
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm"}
@@ -79,6 +82,9 @@ TIMELINE_EARLY_HIDE_SEC = 0.03
 TIMELINE_GAP_BEFORE_NEXT_SEC = 0.05
 TIMELINE_MIN_DURATION_SEC = 0.15
 TIMELINE_MIN_DURATION_FALLBACK_SEC = 0.25
+TIMELINE_LONG_VIDEO_THRESHOLD_SEC = 12 * 60
+TIMELINE_ANCHOR_SEGMENT_SEC = 90
+TIMELINE_MIN_SEGMENT_LINES = 6
 
 
 def parse_drop_files(raw: str) -> list[str]:
@@ -108,6 +114,7 @@ class SubtitleBurnerApp:
         self.custom_crf_var = tk.StringVar(value="")
         self.auto_asr_var = tk.BooleanVar(value=False)
         self.align_timeline_var = tk.BooleanVar(value=False)
+        self.fast_align_var = tk.BooleanVar(value=True)
         self.asr_model_label = tk.StringVar(value="快速（small）")
         self.processing = False
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -115,6 +122,7 @@ class SubtitleBurnerApp:
         self.ffprobe_bin = self._resolve_ffprobe_bin()
         self.whisper_models: dict[str, WhisperModel] = {}
         self.whisper_model_lock = threading.Lock()
+        self._once_log_keys: set[str] = set()
 
         self._build_ui()
         self.quality_mode_label.trace_add("write", self._on_quality_mode_changed)
@@ -169,6 +177,11 @@ class SubtitleBurnerApp:
             asr_row,
             text="有SRT时用自动时间轴校准文字",
             variable=self.align_timeline_var,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Checkbutton(
+            asr_row,
+            text="快速对轴（推荐）",
+            variable=self.fast_align_var,
         ).pack(side=tk.LEFT, padx=(12, 0))
 
         asr_model_row = ttk.Frame(frame)
@@ -262,6 +275,7 @@ class SubtitleBurnerApp:
             self.video_path.set(path)
             if not self.output_path.get():
                 self.output_path.set(self._default_output(path))
+            self._auto_select_asr_model_for_video(path)
 
     def _pick_srt(self):
         path = filedialog.askopenfilename(
@@ -293,6 +307,7 @@ class SubtitleBurnerApp:
                 if not self.output_path.get():
                     self.output_path.set(self._default_output(path))
                 self._log(f"已识别视频: {path}")
+                self._auto_select_asr_model_for_video(path)
             elif ext in SUB_EXTS and not self.srt_path.get():
                 self.srt_path.set(path)
                 self._log(f"已识别字幕: {path}")
@@ -322,10 +337,9 @@ class SubtitleBurnerApp:
         subtitle_size_key = SUBTITLE_SIZE_LABEL_TO_KEY.get(size_label, "medium")
         quality_label = self.quality_mode_label.get().strip() or "匹配源参数（快速推流）"
         quality_mode_key = QUALITY_LABEL_TO_KEY.get(quality_label, "match")
-        asr_model_label = self.asr_model_label.get().strip() or "快速（small）"
-        asr_model_key = ASR_MODEL_LABEL_TO_KEY.get(asr_model_label, "small")
         auto_asr = self.auto_asr_var.get()
         align_timeline = self.align_timeline_var.get()
+        fast_align = self.fast_align_var.get()
         custom_crf_raw = self.custom_crf_var.get().strip()
         custom_crf: str | None = None
 
@@ -339,6 +353,10 @@ class SubtitleBurnerApp:
             messagebox.showerror("参数错误", "请提供 SRT，或启用“自动拾取字幕”。")
             return
         need_asr = (not srt and auto_asr) or (bool(srt) and align_timeline)
+        if need_asr:
+            self._auto_select_asr_model_for_video(video)
+        asr_model_label = self.asr_model_label.get().strip() or "快速（small）"
+        asr_model_key = ASR_MODEL_LABEL_TO_KEY.get(asr_model_label, "small")
         if need_asr and WhisperModel is None:
             messagebox.showerror(
                 "缺少依赖",
@@ -379,6 +397,7 @@ class SubtitleBurnerApp:
                 custom_crf,
                 auto_asr,
                 align_timeline,
+                fast_align,
                 asr_model_key,
             ),
             daemon=True,
@@ -395,6 +414,7 @@ class SubtitleBurnerApp:
         custom_crf: str | None,
         auto_asr: bool,
         align_timeline: bool,
+        fast_align: bool,
         asr_model_key: str,
     ):
         tmpdir = tempfile.mkdtemp(prefix="trad_hardsub_")
@@ -408,7 +428,12 @@ class SubtitleBurnerApp:
                 src_srt = srt
                 if align_timeline:
                     self._log("开始：自动拾取语音时间轴（用于校准提供的SRT文字）")
-                    self._transcribe_video_to_srt(video, asr_srt, asr_model_key)
+                    self._transcribe_video_to_srt(
+                        video,
+                        asr_srt,
+                        asr_model_key,
+                        fast_for_timeline=fast_align,
+                    )
                     self._align_srt_timeline_by_asr(src_srt, asr_srt, aligned_srt)
                     src_srt = aligned_srt
                     self._log(f"已使用自动时间轴校准字幕: {src_srt}")
@@ -416,7 +441,7 @@ class SubtitleBurnerApp:
                     self._log("检测到已提供SRT，自动拾取已跳过。")
             else:
                 self._log("开始：自动拾取简体中文字幕（语音识别）")
-                self._transcribe_video_to_srt(video, src_srt, asr_model_key)
+                self._transcribe_video_to_srt(video, src_srt, asr_model_key, fast_for_timeline=False)
                 self._log(f"自动字幕已生成: {src_srt}")
             self._log("开始：简体字幕 -> 繁体字幕")
             self._convert_to_trad(src_srt, trad_srt)
@@ -564,11 +589,26 @@ class SubtitleBurnerApp:
             raise RuntimeError("ffmpeg 压制失败，请检查字幕编码/视频格式是否可读。")
         self._log(f"ffmpeg 执行完成，用时 {elapsed:.1f}s")
 
-    def _transcribe_video_to_srt(self, video: str, dst_srt: str, model_size: str):
+    def _transcribe_video_to_srt(
+        self,
+        video: str,
+        dst_srt: str,
+        model_size: str,
+        fast_for_timeline: bool = False,
+    ):
         if WhisperModel is None:
             raise RuntimeError("缺少 faster-whisper 依赖，无法自动拾取字幕。")
         model = self._get_whisper_model(model_size)
-        segments, _info = model.transcribe(video, language="zh", vad_filter=True, beam_size=5)
+        transcribe_args = {
+            "language": "zh",
+            "vad_filter": True,
+            "beam_size": 1 if fast_for_timeline else 5,
+        }
+        if fast_for_timeline:
+            transcribe_args["condition_on_previous_text"] = False
+            transcribe_args["temperature"] = 0.0
+            self._log("快速对轴已启用：beam_size=1（仅用于时间轴校准）")
+        segments, _info = model.transcribe(video, **transcribe_args)
 
         count = 0
         with open(dst_srt, "w", encoding="utf-8") as f:
@@ -580,6 +620,8 @@ class SubtitleBurnerApp:
                 end = self._format_srt_timestamp(seg.end)
                 count += 1
                 f.write(f"{count}\n{start} --> {end}\n{text}\n\n")
+                if count % 20 == 0:
+                    self._log(f"识别进度：已生成 {count} 条（到 {end}）")
         if count == 0:
             raise RuntimeError("自动拾取未生成有效字幕，请检查视频语音是否清晰。")
         self._log(f"自动拾取完成，共 {count} 条字幕。")
@@ -592,8 +634,13 @@ class SubtitleBurnerApp:
             if cached is not None:
                 self._log(f"识别模型命中缓存: {model_size}")
                 return cached
-            cpu_threads = max(1, min((os.cpu_count() or 4), 8))
-            num_workers = max(1, min(cpu_threads // 2, 4))
+            cpu_threads = max(1, min((os.cpu_count() or 4), 16))
+            num_workers = max(1, min(cpu_threads // 2, 8))
+            if model_size == "medium" and not self._is_whisper_model_cached("medium"):
+                self._log_once(
+                    "medium_download_hint",
+                    "medium 模型未缓存，首次会在线下载，网络慢时可能耗时较长。",
+                )
             self._log(
                 f"加载识别模型: {model_size}（首次使用可能会下载模型）"
                 f" cpu_threads={cpu_threads} num_workers={num_workers}"
@@ -620,8 +667,96 @@ class SubtitleBurnerApp:
         a_count = len(asr_entries)
         self._log(f"校准时间轴：原字幕 {t_count} 条，自动时间轴 {a_count} 条")
 
-        # Use text-length pace mapping instead of plain index mapping.
-        # This gives earlier/later timing in proportion to speech density.
+        asr_start = asr_entries[0]["start"]
+        asr_end = asr_entries[-1]["end"]
+        asr_span = max(0.5, asr_end - asr_start)
+        long_video = asr_span >= TIMELINE_LONG_VIDEO_THRESHOLD_SEC
+
+        if long_video:
+            self._log(
+                f"长视频校准策略：分段锚点（阈值 {TIMELINE_LONG_VIDEO_THRESHOLD_SEC}s，"
+                f"段长≈{TIMELINE_ANCHOR_SEGMENT_SEC}s）"
+            )
+            aligned = self._align_timeline_segmented_anchor(text_entries, asr_entries)
+        else:
+            self._log("短视频校准策略：全片字符节奏映射")
+            aligned = self._align_timeline_by_char_counts(text_entries, asr_entries)
+
+        self._post_process_aligned_entries(aligned, asr_start, asr_end)
+
+        self._write_srt_entries(dst_srt, aligned)
+
+    def _align_timeline_segmented_anchor(
+        self, text_entries: list[dict], asr_entries: list[dict]
+    ) -> list[dict]:
+        src_start = text_entries[0]["start"]
+        src_end = text_entries[-1]["end"]
+        src_span = max(0.5, src_end - src_start)
+        asr_start = asr_entries[0]["start"]
+        asr_end = asr_entries[-1]["end"]
+        asr_span = max(0.5, asr_end - asr_start)
+
+        seg_count = max(1, int(math.ceil(src_span / TIMELINE_ANCHOR_SEGMENT_SEC)))
+        self._log(f"分段锚点：共 {seg_count} 段")
+
+        text_mid = [0.5 * (x["start"] + x["end"]) for x in text_entries]
+        asr_mid = [0.5 * (x["start"] + x["end"]) for x in asr_entries]
+        aligned: list[dict | None] = [None] * len(text_entries)
+
+        for seg_idx in range(seg_count):
+            seg_src_start = src_start + seg_idx * TIMELINE_ANCHOR_SEGMENT_SEC
+            if seg_idx == seg_count - 1:
+                seg_src_end = src_end
+            else:
+                seg_src_end = min(src_end, seg_src_start + TIMELINE_ANCHOR_SEGMENT_SEC)
+
+            r0 = (seg_src_start - src_start) / src_span
+            r1 = (seg_src_end - src_start) / src_span
+            seg_asr_start = asr_start + r0 * asr_span
+            seg_asr_end = asr_start + r1 * asr_span
+
+            if seg_idx == seg_count - 1:
+                t_idx = [i for i, t in enumerate(text_mid) if seg_src_start <= t <= seg_src_end]
+                a_idx = [i for i, t in enumerate(asr_mid) if seg_asr_start <= t <= seg_asr_end]
+            else:
+                t_idx = [i for i, t in enumerate(text_mid) if seg_src_start <= t < seg_src_end]
+                a_idx = [i for i, t in enumerate(asr_mid) if seg_asr_start <= t < seg_asr_end]
+
+            if not t_idx:
+                continue
+
+            # Segment too sparse: fallback to nearest ASR slice so every block can be mapped.
+            if len(a_idx) < TIMELINE_MIN_SEGMENT_LINES:
+                center_ratio = max(0.0, min(1.0, (r0 + r1) * 0.5))
+                center = int(round(center_ratio * max(0, len(asr_entries) - 1)))
+                radius = max(TIMELINE_MIN_SEGMENT_LINES, len(t_idx) // 2 + 3)
+                left = max(0, center - radius)
+                right = min(len(asr_entries), center + radius + 1)
+                a_idx = list(range(left, right))
+            if not a_idx:
+                continue
+
+            seg_text_entries = [text_entries[i] for i in t_idx]
+            seg_asr_entries = [asr_entries[i] for i in a_idx]
+            seg_aligned = self._align_timeline_by_char_counts(seg_text_entries, seg_asr_entries)
+
+            for local_i, global_i in enumerate(t_idx):
+                aligned[global_i] = seg_aligned[local_i]
+
+        if any(x is None for x in aligned):
+            self._log("分段锚点补全：个别分段缺口，使用全片映射补齐")
+            fallback = self._align_timeline_by_char_counts(text_entries, asr_entries)
+            for i in range(len(aligned)):
+                if aligned[i] is None:
+                    aligned[i] = fallback[i]
+
+        if any(x is None for x in aligned):
+            raise RuntimeError("分段锚点校准失败：无法完成全部字幕映射。")
+        return [x for x in aligned if x is not None]
+
+    def _align_timeline_by_char_counts(
+        self, text_entries: list[dict], asr_entries: list[dict]
+    ) -> list[dict]:
         asr_counts = [max(1, self._effective_text_len(x["text"])) for x in asr_entries]
         text_counts = [max(1, self._effective_text_len(x["text"])) for x in text_entries]
 
@@ -629,7 +764,6 @@ class SubtitleBurnerApp:
         text_total = sum(text_counts)
         asr_start = asr_entries[0]["start"]
         asr_end = asr_entries[-1]["end"]
-        asr_span = max(0.5, asr_end - asr_start)
 
         cum_asr = [0]
         for n in asr_counts:
@@ -656,15 +790,15 @@ class SubtitleBurnerApp:
             start_sec = asr_ratio_to_time(start_ratio)
             end_sec = asr_ratio_to_time(end_ratio)
 
-            # Show slightly earlier, hide slightly earlier to reduce lingering.
             start_sec = max(asr_start, start_sec - TIMELINE_EARLY_SHOW_SEC)
             end_sec = min(asr_end, end_sec - TIMELINE_EARLY_HIDE_SEC)
             if end_sec <= start_sec:
                 end_sec = min(asr_end, start_sec + TIMELINE_MIN_DURATION_FALLBACK_SEC)
 
             aligned.append({"start": start_sec, "end": end_sec, "text": ent["text"]})
+        return aligned
 
-        # Enforce no overlap and timely disappear before next line.
+    def _post_process_aligned_entries(self, aligned: list[dict], asr_start: float, asr_end: float):
         for i in range(len(aligned) - 1):
             max_end = aligned[i + 1]["start"] - TIMELINE_GAP_BEFORE_NEXT_SEC
             if aligned[i]["end"] > max_end:
@@ -672,13 +806,12 @@ class SubtitleBurnerApp:
             if aligned[i]["end"] <= aligned[i]["start"]:
                 aligned[i]["end"] = aligned[i]["start"] + TIMELINE_MIN_DURATION_SEC
         for i in range(len(aligned)):
+            aligned[i]["start"] = max(asr_start, aligned[i]["start"])
             if i > 0 and aligned[i]["start"] < aligned[i - 1]["end"]:
                 aligned[i]["start"] = aligned[i - 1]["end"] + 0.02
             if aligned[i]["end"] <= aligned[i]["start"]:
                 aligned[i]["end"] = aligned[i]["start"] + TIMELINE_MIN_DURATION_SEC
-            aligned[i]["end"] = min(aligned[i]["end"], asr_start + asr_span)
-
-        self._write_srt_entries(dst_srt, aligned)
+            aligned[i]["end"] = min(aligned[i]["end"], asr_end)
 
     def _parse_srt_entries(self, srt_path: str) -> list[dict]:
         with open(srt_path, "r", encoding="utf-8-sig", errors="ignore") as f:
@@ -767,7 +900,7 @@ class SubtitleBurnerApp:
             "error",
             "-show_entries",
             (
-                "format=bit_rate:"
+                "format=bit_rate,duration:"
                 "stream=index,codec_type,bit_rate,avg_frame_rate,r_frame_rate,width,height,"
                 "pix_fmt,profile,level,sample_rate,channels,codec_name"
             ),
@@ -814,6 +947,7 @@ class SubtitleBurnerApp:
         return {
             "width": int(video_stream.get("width") or 0),
             "height": int(video_stream.get("height") or 0),
+            "duration_sec": self._safe_float(fmt.get("duration")),
             "fps": fps,
             "video_bitrate": video_bitrate,
             "audio_bitrate": audio_bitrate,
@@ -822,11 +956,58 @@ class SubtitleBurnerApp:
             "level": video_stream.get("level") or "",
         }
 
+    def _auto_select_asr_model_for_video(self, video: str):
+        current_label = self.asr_model_label.get().strip() or "快速（small）"
+        if current_label != "快速（small）":
+            return
+        media = self._probe_source_media(video)
+        if not media:
+            return
+        duration_sec = media.get("duration_sec")
+        if not duration_sec:
+            return
+        if duration_sec >= TIMELINE_LONG_VIDEO_THRESHOLD_SEC:
+            if self._is_whisper_model_cached("medium"):
+                self.asr_model_label.set("平衡（medium）")
+                self._log(
+                    f"检测到长视频（{duration_sec/60:.1f} 分钟），"
+                    "识别模型已自动切换为 medium。"
+                )
+            else:
+                self._log_once(
+                    "keep_small_no_medium_cache",
+                    f"检测到长视频（{duration_sec/60:.1f} 分钟），"
+                    "但 medium 尚未缓存。为避免首次下载等待，暂保持 small。",
+                )
+
+    def _is_whisper_model_cached(self, model_size: str) -> bool:
+        if whisper_download_model is None:
+            return False
+        try:
+            whisper_download_model(model_size, local_files_only=True)
+            return True
+        except Exception:
+            return False
+
+    def _log_once(self, key: str, msg: str):
+        if key in self._once_log_keys:
+            return
+        self._once_log_keys.add(key)
+        self._log(msg)
+
     def _safe_int(self, value) -> int | None:
         try:
             if value is None:
                 return None
             return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _safe_float(self, value) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(str(value).strip())
         except (TypeError, ValueError):
             return None
 
