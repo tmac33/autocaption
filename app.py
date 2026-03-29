@@ -38,6 +38,11 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm"}
 SUB_EXTS = {".srt"}
 SUBTITLE_SIZE_MAP = {"small": 18, "medium": 24, "large": 30}
 SUBTITLE_SIZE_LABEL_TO_KEY = {"小": "small", "中": "medium", "大": "large"}
+SUBTITLE_STYLE_LABEL_TO_KEY = {
+    "标准": "standard",
+    "大字描边": "bold_outline",
+    "讲解视频风格": "lecture",
+}
 QUALITY_LABEL_TO_KEY = {
     "匹配源参数（快速推流）": "match",
     "极致画质": "quality",
@@ -85,6 +90,12 @@ TIMELINE_MIN_DURATION_FALLBACK_SEC = 0.25
 TIMELINE_LONG_VIDEO_THRESHOLD_SEC = 12 * 60
 TIMELINE_ANCHOR_SEGMENT_SEC = 90
 TIMELINE_MIN_SEGMENT_LINES = 6
+FORCE_SINGLE_LINE_CHAR_LIMIT = {
+    "small": 18,
+    "medium": 14,
+    "large": 10,
+}
+LECTURE_BOX_OPACITY_DEFAULT = 60
 
 
 def parse_drop_files(raw: str) -> list[str]:
@@ -110,8 +121,11 @@ class SubtitleBurnerApp:
         self.srt_path = tk.StringVar()
         self.output_path = tk.StringVar()
         self.subtitle_size_label = tk.StringVar(value="中")
+        self.subtitle_style_label = tk.StringVar(value="标准")
+        self.subtitle_box_opacity_var = tk.StringVar(value=str(LECTURE_BOX_OPACITY_DEFAULT))
         self.quality_mode_label = tk.StringVar(value="匹配源参数（快速推流）")
         self.custom_crf_var = tk.StringVar(value="")
+        self.force_single_line_var = tk.BooleanVar(value=False)
         self.auto_asr_var = tk.BooleanVar(value=False)
         self.align_timeline_var = tk.BooleanVar(value=False)
         self.fast_align_var = tk.BooleanVar(value=True)
@@ -120,6 +134,7 @@ class SubtitleBurnerApp:
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.ffmpeg_bin = self._resolve_ffmpeg_bin()
         self.ffprobe_bin = self._resolve_ffprobe_bin()
+        self.ffmpeg_subtitles_supported: bool | None = None
         self.whisper_models: dict[str, WhisperModel] = {}
         self.whisper_model_lock = threading.Lock()
         self._once_log_keys: set[str] = set()
@@ -207,6 +222,32 @@ class SubtitleBurnerApp:
             width=10,
         )
         size_combo.pack(side=tk.LEFT, padx=(8, 0))
+
+        subtitle_style_row = ttk.Frame(frame)
+        subtitle_style_row.pack(fill=tk.X, pady=4)
+        ttk.Label(subtitle_style_row, text="字幕风格", width=18).pack(side=tk.LEFT)
+        subtitle_style_combo = ttk.Combobox(
+            subtitle_style_row,
+            textvariable=self.subtitle_style_label,
+            values=["标准", "大字描边", "讲解视频风格"],
+            state="readonly",
+            width=18,
+        )
+        subtitle_style_combo.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(
+            subtitle_style_row,
+            text="强制一行字幕",
+            variable=self.force_single_line_var,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(subtitle_style_row, text="底板透明度", width=12).pack(side=tk.LEFT, padx=(18, 0))
+        subtitle_opacity_combo = ttk.Combobox(
+            subtitle_style_row,
+            textvariable=self.subtitle_box_opacity_var,
+            values=["20", "30", "40", "50", "60", "70", "80"],
+            state="readonly",
+            width=6,
+        )
+        subtitle_opacity_combo.pack(side=tk.LEFT, padx=(8, 0))
 
         quality_row = ttk.Frame(frame)
         quality_row.pack(fill=tk.X, pady=4)
@@ -329,12 +370,24 @@ class SubtitleBurnerApp:
                 "未找到 ffmpeg。\n请先安装：brew install ffmpeg",
             )
             return
+        if not self._ffmpeg_supports_subtitles_filter():
+            messagebox.showerror(
+                "ffmpeg 功能缺失",
+                "当前 ffmpeg 不支持 subtitles 滤镜（缺少 libass）。\n\n"
+                "请安装支持 libass 的 ffmpeg，再重新运行。\n"
+                "你当前的 ffmpeg 无法硬压字幕。",
+            )
+            return
 
         video = self.video_path.get().strip()
         srt = self.srt_path.get().strip()
         output = self.output_path.get().strip()
         size_label = self.subtitle_size_label.get().strip() or "中"
         subtitle_size_key = SUBTITLE_SIZE_LABEL_TO_KEY.get(size_label, "medium")
+        subtitle_style_label = self.subtitle_style_label.get().strip() or "标准"
+        subtitle_style_key = SUBTITLE_STYLE_LABEL_TO_KEY.get(subtitle_style_label, "standard")
+        subtitle_box_opacity = self._parse_subtitle_box_opacity(self.subtitle_box_opacity_var.get())
+        force_single_line = self.force_single_line_var.get()
         quality_label = self.quality_mode_label.get().strip() or "匹配源参数（快速推流）"
         quality_mode_key = QUALITY_LABEL_TO_KEY.get(quality_label, "match")
         auto_asr = self.auto_asr_var.get()
@@ -393,6 +446,9 @@ class SubtitleBurnerApp:
                 srt,
                 output,
                 subtitle_size_key,
+                subtitle_style_key,
+                subtitle_box_opacity,
+                force_single_line,
                 quality_mode_key,
                 custom_crf,
                 auto_asr,
@@ -410,6 +466,9 @@ class SubtitleBurnerApp:
         srt: str,
         output: str,
         subtitle_size_key: str,
+        subtitle_style_key: str,
+        subtitle_box_opacity: int,
+        force_single_line: bool,
         quality_mode_key: str,
         custom_crf: str | None,
         auto_asr: bool,
@@ -446,12 +505,24 @@ class SubtitleBurnerApp:
             self._log("开始：简体字幕 -> 繁体字幕")
             self._convert_to_trad(src_srt, trad_srt)
             self._log(f"繁体字幕已生成: {trad_srt}")
+            media = self._probe_source_media(video)
+            if force_single_line:
+                self._log("开始：强制一行字幕整理")
+                self._force_single_line_subtitles(
+                    trad_srt,
+                    subtitle_size_key,
+                    subtitle_style_key,
+                    media,
+                )
+                self._log("强制一行字幕已完成")
             self._log("开始：YouTube 硬字幕压制（H.264）")
             self._burn_subtitle_youtube(
                 video,
                 trad_srt,
                 output,
                 subtitle_size_key,
+                subtitle_style_key,
+                subtitle_box_opacity,
                 quality_mode_key,
                 custom_crf,
             )
@@ -477,6 +548,8 @@ class SubtitleBurnerApp:
         trad_srt: str,
         output: str,
         subtitle_size_key: str,
+        subtitle_style_key: str,
+        subtitle_box_opacity: int,
         quality_mode_key: str,
         custom_crf: str | None,
     ):
@@ -484,18 +557,16 @@ class SubtitleBurnerApp:
         trad_srt = os.path.abspath(trad_srt)
         output = os.path.abspath(output)
         encoding = YOUTUBE_ENCODING_PROFILES.get(quality_mode_key, YOUTUBE_ENCODING_PROFILES["quality"])
+        media = self._probe_source_media(video)
 
-        font_size = SUBTITLE_SIZE_MAP.get(subtitle_size_key, 24)
-        style = (
-            f"FontName=Arial,FontSize={font_size},Outline=1.2,Shadow=0.8,"
-            "PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&"
+        vf = self._build_subtitle_filter(
+            trad_srt,
+            subtitle_size_key,
+            subtitle_style_key,
+            subtitle_box_opacity,
+            media,
         )
-        escaped_srt = (
-            trad_srt.replace("\\", "\\\\")
-            .replace(":", r"\:")
-            .replace("'", r"\'")
-        )
-        vf = f"subtitles='{escaped_srt}':force_style='{style}'"
+        self._log(f"字幕风格：{subtitle_style_key} 底板透明度={subtitle_box_opacity}%")
         cmd = [
             self.ffmpeg_bin,
             "-y",
@@ -513,7 +584,7 @@ class SubtitleBurnerApp:
             encoding["audio_codec"],
         ]
         if quality_mode_key == "match":
-            matched = self._probe_source_media(video)
+            matched = media
             if matched:
                 video_bitrate = matched["video_bitrate"]
                 audio_bitrate = matched["audio_bitrate"]
@@ -568,7 +639,7 @@ class SubtitleBurnerApp:
                 + (f" maxrate={encoding['maxrate']}" if encoding["maxrate"] else "")
             )
         cmd.append(output)
-        self._log("ffmpeg 命令已构建（已省略长参数）")
+        self._log(f"ffmpeg 命令: {' '.join(self._shell_quote(x) for x in cmd)}")
 
         start = time.time()
         proc = subprocess.Popen(
@@ -580,12 +651,29 @@ class SubtitleBurnerApp:
             universal_newlines=True,
         )
         assert proc.stdout is not None
+        output_tail: list[str] = []
         for line in proc.stdout:
-            if "time=" in line or "frame=" in line:
-                self._log(line.strip())
+            clean = line.strip()
+            if not clean:
+                continue
+            output_tail.append(clean)
+            if len(output_tail) > 30:
+                output_tail.pop(0)
+            if "time=" in clean or "frame=" in clean:
+                self._log(clean)
+            elif any(
+                token in clean.lower()
+                for token in ("error", "failed", "invalid", "unable", "could not", "no such file")
+            ):
+                self._log(f"ffmpeg: {clean}")
         code = proc.wait()
         elapsed = time.time() - start
         if code != 0:
+            if output_tail:
+                self._log("ffmpeg 失败尾部日志：")
+                for item in output_tail[-12:]:
+                    self._log(f"ffmpeg: {item}")
+                raise RuntimeError(f"ffmpeg 压制失败：{output_tail[-1]}")
             raise RuntimeError("ffmpeg 压制失败，请检查字幕编码/视频格式是否可读。")
         self._log(f"ffmpeg 执行完成，用时 {elapsed:.1f}s")
 
@@ -848,6 +936,99 @@ class SubtitleBurnerApp:
                 end = self._format_srt_timestamp(ent["end"])
                 f.write(f"{idx}\n{start} --> {end}\n{ent['text']}\n\n")
 
+    def _force_single_line_subtitles(
+        self,
+        srt_path: str,
+        subtitle_size_key: str,
+        subtitle_style_key: str,
+        media: dict | None,
+    ):
+        entries = self._parse_srt_entries(srt_path)
+        if not entries:
+            return
+        char_limit = self._compute_single_line_char_limit(
+            subtitle_size_key,
+            subtitle_style_key,
+            media,
+        )
+        flattened: list[dict] = []
+
+        for ent in entries:
+            merged = self._normalize_single_line_text(ent["text"])
+            if not merged:
+                continue
+            chunks = self._split_text_for_single_line(merged, char_limit)
+            if len(chunks) <= 1:
+                flattened.append({"start": ent["start"], "end": ent["end"], "text": merged})
+                continue
+
+            total_duration = max(TIMELINE_MIN_DURATION_FALLBACK_SEC, ent["end"] - ent["start"])
+            weights = [max(1, self._effective_text_len(chunk)) for chunk in chunks]
+            weight_total = max(1, sum(weights))
+            cursor = ent["start"]
+
+            for idx, chunk in enumerate(chunks):
+                if idx == len(chunks) - 1:
+                    chunk_end = ent["end"]
+                else:
+                    portion = total_duration * (weights[idx] / weight_total)
+                    chunk_end = cursor + max(TIMELINE_MIN_DURATION_SEC, portion)
+                flattened.append({"start": cursor, "end": chunk_end, "text": chunk})
+                cursor = chunk_end
+
+        for i in range(len(flattened) - 1):
+            if flattened[i]["end"] > flattened[i + 1]["start"]:
+                flattened[i]["end"] = flattened[i + 1]["start"]
+            if flattened[i]["end"] <= flattened[i]["start"]:
+                flattened[i]["end"] = flattened[i]["start"] + TIMELINE_MIN_DURATION_SEC
+        self._write_srt_entries(srt_path, flattened)
+
+    def _normalize_single_line_text(self, text: str) -> str:
+        merged = re.sub(r"\s*\n\s*", "", text)
+        merged = re.sub(r"\s+", " ", merged).strip()
+        return merged
+
+    def _split_text_for_single_line(self, text: str, char_limit: int) -> list[str]:
+        if self._effective_text_len(text) <= char_limit:
+            return [text]
+
+        chunks: list[str] = []
+        current = ""
+        for char in text:
+            candidate = current + char
+            if current and self._effective_text_len(candidate) > char_limit:
+                chunks.append(current.strip())
+                current = char
+            else:
+                current = candidate
+        if current.strip():
+            chunks.append(current.strip())
+        return [chunk for chunk in chunks if chunk]
+
+    def _compute_single_line_char_limit(
+        self,
+        subtitle_size_key: str,
+        subtitle_style_key: str,
+        media: dict | None,
+    ) -> int:
+        limit = FORCE_SINGLE_LINE_CHAR_LIMIT.get(subtitle_size_key, 14)
+        if subtitle_style_key == "lecture":
+            limit -= 2
+        elif subtitle_style_key == "bold_outline":
+            limit -= 1
+
+        if media:
+            width = int(media.get("width") or 0)
+            height = int(media.get("height") or 0)
+            if width > 0 and height > width:
+                limit -= 4
+            elif width > 0 and width / max(1, height) < 1.45:
+                limit -= 2
+
+        adjusted = max(6, limit)
+        self._log(f"强制一行阈值：{adjusted} 字")
+        return adjusted
+
     def _effective_text_len(self, text: str) -> int:
         cleaned = re.sub(r"\s+", "", text)
         cleaned = re.sub(r"[，。！？、；：,.!?;:\"'“”‘’（）()\\[\\]{}<>《》-]", "", cleaned)
@@ -874,6 +1055,12 @@ class SubtitleBurnerApp:
         return h * 3600 + minute * 60 + sec + ms / 1000.0
 
     def _resolve_ffmpeg_bin(self) -> str | None:
+        for candidate in (
+            "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+            "/usr/local/opt/ffmpeg-full/bin/ffmpeg",
+        ):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             return ffmpeg
@@ -883,6 +1070,12 @@ class SubtitleBurnerApp:
         return None
 
     def _resolve_ffprobe_bin(self) -> str | None:
+        for candidate in (
+            "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe",
+            "/usr/local/opt/ffmpeg-full/bin/ffprobe",
+        ):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
         ffprobe = shutil.which("ffprobe")
         if ffprobe:
             return ffprobe
@@ -890,6 +1083,29 @@ class SubtitleBurnerApp:
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                 return candidate
         return None
+
+    def _ffmpeg_supports_subtitles_filter(self) -> bool:
+        if self.ffmpeg_subtitles_supported is not None:
+            return self.ffmpeg_subtitles_supported
+        if not self.ffmpeg_bin:
+            self.ffmpeg_subtitles_supported = False
+            return False
+        try:
+            output = subprocess.check_output(
+                [self.ffmpeg_bin, "-filters"],
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            supported = re.search(r"\bsubtitles\b", output) is not None
+        except Exception:
+            supported = False
+        self.ffmpeg_subtitles_supported = supported
+        if not supported:
+            self._log_once(
+                "ffmpeg_no_subtitles_filter",
+                "检测到当前 ffmpeg 不支持 subtitles 滤镜，硬字幕压制会失败。",
+            )
+        return supported
 
     def _probe_source_media(self, video: str) -> dict | None:
         if not self.ffprobe_bin:
@@ -1047,6 +1263,96 @@ class SubtitleBurnerApp:
 
     def _format_bitrate(self, bps: int) -> str:
         return self._to_ffmpeg_bitrate_k(bps)
+
+    def _shell_quote(self, value: str) -> str:
+        return subprocess.list2cmdline([value])
+
+    def _escape_subtitles_filter_value(self, value: str) -> str:
+        return (
+            value.replace("\\", r"\\")
+            .replace(":", r"\:")
+            .replace("'", r"\'")
+            .replace("[", r"\[")
+            .replace("]", r"\]")
+            .replace(",", r"\,")
+        )
+
+    def _build_subtitle_filter(
+        self,
+        trad_srt: str,
+        subtitle_size_key: str,
+        subtitle_style_key: str,
+        subtitle_box_opacity: int,
+        media: dict | None,
+    ) -> str:
+        font_size = self._compute_adaptive_font_size(subtitle_size_key, media)
+        escaped_srt = self._escape_subtitles_filter_value(trad_srt)
+
+        if subtitle_style_key == "bold_outline":
+            style = (
+                f"FontName=Arial Bold,FontSize={font_size + 4},Bold=1,"
+                "Outline=2.2,Shadow=0.2,Spacing=0.4,MarginV=24,"
+                "PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&"
+            )
+            escaped_style = self._escape_subtitles_filter_value(style)
+            return f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'"
+
+        if subtitle_style_key == "lecture":
+            back_alpha = self._opacity_percent_to_ass_alpha(subtitle_box_opacity)
+            style = (
+                f"FontName=Arial Bold,FontSize={font_size + 4},Bold=1,"
+                "Outline=2.6,Shadow=0,Spacing=0.2,MarginV=30,MarginL=44,MarginR=44,"
+                "Alignment=2,BorderStyle=3,WrapStyle=2,PrimaryColour=&H00FFFFFF&,"
+                f"OutlineColour=&H{back_alpha}000000&,BackColour=&H{back_alpha}000000&"
+            )
+            escaped_style = self._escape_subtitles_filter_value(style)
+            return f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'"
+
+        style = (
+            f"FontName=Arial,FontSize={font_size},Outline=1.2,Shadow=0.8,"
+            "MarginV=20,PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&"
+        )
+        escaped_style = self._escape_subtitles_filter_value(style)
+        return f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'"
+
+    def _compute_adaptive_font_size(self, subtitle_size_key: str, media: dict | None) -> int:
+        base = SUBTITLE_SIZE_MAP.get(subtitle_size_key, 24)
+        if not media:
+            return base
+
+        width = int(media.get("width") or 0)
+        height = int(media.get("height") or 0)
+        if width <= 0 or height <= 0:
+            return base
+
+        if height > width:
+            ratio = 0.62
+            orientation = "竖屏"
+        elif width / max(1, height) < 1.45:
+            ratio = 0.80
+            orientation = "近方屏"
+        else:
+            ratio = 1.0
+            orientation = "横屏"
+
+        adaptive = max(14, int(round(base * ratio)))
+        self._log(
+            f"字幕字号自适应：{orientation} {width}x{height} "
+            f"base={base} adjusted={adaptive}"
+        )
+        return adaptive
+
+    def _parse_subtitle_box_opacity(self, raw: str) -> int:
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return LECTURE_BOX_OPACITY_DEFAULT
+        return max(0, min(100, value))
+
+    def _opacity_percent_to_ass_alpha(self, opacity_percent: int) -> str:
+        opacity = max(0, min(100, opacity_percent))
+        alpha = int(round(255 * (100 - opacity) / 100))
+        return f"{alpha:02X}"
 
     def _reset_ui(self):
         self.processing = False
