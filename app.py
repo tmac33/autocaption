@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import difflib
 import json
 import math
 import os
@@ -96,6 +97,7 @@ FORCE_SINGLE_LINE_CHAR_LIMIT = {
     "large": 10,
 }
 LECTURE_BOX_OPACITY_DEFAULT = 60
+SINGLE_LINE_MIN_CHUNK_DURATION_SEC = 0.9
 
 
 def parse_drop_files(raw: str) -> list[str]:
@@ -190,7 +192,7 @@ class SubtitleBurnerApp:
         ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Checkbutton(
             asr_row,
-            text="有SRT时用自动时间轴校准文字",
+            text="使用提供的SRT修正自动识别文字（保留自动时间轴）",
             variable=self.align_timeline_var,
         ).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Checkbutton(
@@ -479,23 +481,23 @@ class SubtitleBurnerApp:
         tmpdir = tempfile.mkdtemp(prefix="trad_hardsub_")
         src_srt = os.path.join(tmpdir, "subtitle_src.srt")
         asr_srt = os.path.join(tmpdir, "subtitle_asr.srt")
-        aligned_srt = os.path.join(tmpdir, "subtitle_aligned.srt")
+        corrected_srt = os.path.join(tmpdir, "subtitle_corrected.srt")
         trad_srt = os.path.join(tmpdir, "subtitle_trad.srt")
 
         try:
             if srt and os.path.isfile(srt):
                 src_srt = srt
                 if align_timeline:
-                    self._log("开始：自动拾取语音时间轴（用于校准提供的SRT文字）")
+                    self._log("开始：自动拾取语音时间轴（保留自动时间轴，用提供的SRT修正文案）")
                     self._transcribe_video_to_srt(
                         video,
                         asr_srt,
                         asr_model_key,
                         fast_for_timeline=fast_align,
                     )
-                    self._align_srt_timeline_by_asr(src_srt, asr_srt, aligned_srt)
-                    src_srt = aligned_srt
-                    self._log(f"已使用自动时间轴校准字幕: {src_srt}")
+                    self._correct_asr_text_with_srt(src_srt, asr_srt, corrected_srt)
+                    src_srt = corrected_srt
+                    self._log(f"已生成“自动时间轴 + SRT修正文案”字幕: {src_srt}")
                 elif auto_asr:
                     self._log("检测到已提供SRT，自动拾取已跳过。")
             else:
@@ -695,7 +697,7 @@ class SubtitleBurnerApp:
         if fast_for_timeline:
             transcribe_args["condition_on_previous_text"] = False
             transcribe_args["temperature"] = 0.0
-            self._log("快速对轴已启用：beam_size=1（仅用于时间轴校准）")
+            self._log("快速对轴已启用：beam_size=1（仅用于自动时间轴 + SRT文案修正）")
         segments, _info = model.transcribe(video, **transcribe_args)
 
         count = 0
@@ -755,24 +757,117 @@ class SubtitleBurnerApp:
         a_count = len(asr_entries)
         self._log(f"校准时间轴：原字幕 {t_count} 条，自动时间轴 {a_count} 条")
 
+        align_units = self._collapse_entries_for_alignment(text_entries)
+        asr_units = self._collapse_entries_for_alignment(asr_entries)
+        if len(align_units) != len(text_entries):
+            self._log(f"字幕校准预处理：已将 {t_count} 条碎片字幕合并为 {len(align_units)} 个语义块")
+        if len(asr_units) != len(asr_entries):
+            self._log(f"ASR 预处理：已将 {a_count} 条识别字幕合并为 {len(asr_units)} 个语义块")
+
         asr_start = asr_entries[0]["start"]
         asr_end = asr_entries[-1]["end"]
-        asr_span = max(0.5, asr_end - asr_start)
-        long_video = asr_span >= TIMELINE_LONG_VIDEO_THRESHOLD_SEC
+        try:
+            self._log("校准策略：文本相似度匹配对齐")
+            aligned_units = self._align_units_by_text_matching(align_units, asr_units)
+        except Exception as exc:
+            self._log(f"文本匹配对齐失败，回退字符节奏映射：{exc}")
+            asr_span = max(0.5, asr_end - asr_start)
+            long_video = asr_span >= TIMELINE_LONG_VIDEO_THRESHOLD_SEC
+            if long_video:
+                self._log(
+                    f"长视频回退策略：分段锚点（阈值 {TIMELINE_LONG_VIDEO_THRESHOLD_SEC}s，"
+                    f"段长≈{TIMELINE_ANCHOR_SEGMENT_SEC}s）"
+                )
+                aligned_units = self._align_timeline_segmented_anchor(align_units, asr_entries)
+            else:
+                self._log("短视频回退策略：全片字符节奏映射")
+                aligned_units = self._align_timeline_by_char_counts(align_units, asr_entries)
 
-        if long_video:
-            self._log(
-                f"长视频校准策略：分段锚点（阈值 {TIMELINE_LONG_VIDEO_THRESHOLD_SEC}s，"
-                f"段长≈{TIMELINE_ANCHOR_SEGMENT_SEC}s）"
-            )
-            aligned = self._align_timeline_segmented_anchor(text_entries, asr_entries)
-        else:
-            self._log("短视频校准策略：全片字符节奏映射")
-            aligned = self._align_timeline_by_char_counts(text_entries, asr_entries)
+        aligned = self._expand_aligned_units_to_entries(text_entries, align_units, aligned_units)
 
         self._post_process_aligned_entries(aligned, asr_start, asr_end)
 
         self._write_srt_entries(dst_srt, aligned)
+
+    def _correct_asr_text_with_srt(self, text_srt: str, asr_srt: str, dst_srt: str):
+        text_entries = self._parse_srt_entries(text_srt)
+        asr_entries = self._parse_srt_entries(asr_srt)
+        if not text_entries:
+            raise RuntimeError("提供的SRT没有可用字幕内容。")
+        if not asr_entries:
+            raise RuntimeError("自动拾取未生成可用字幕，无法修正文案。")
+
+        t_count = len(text_entries)
+        a_count = len(asr_entries)
+        self._log(f"修正文案：提供SRT {t_count} 条，自动识别 {a_count} 条")
+
+        text_units = self._collapse_entries_for_alignment(text_entries)
+        asr_units = self._collapse_entries_for_alignment(asr_entries)
+        if len(text_units) != len(text_entries):
+            self._log(f"SRT 预处理：已将 {t_count} 条碎片字幕合并为 {len(text_units)} 个语义块")
+        if len(asr_units) != len(asr_entries):
+            self._log(f"ASR 预处理：已将 {a_count} 条识别字幕合并为 {len(asr_units)} 个语义块")
+
+        self._log("修正策略：保留自动时间轴，用提供的SRT修正自动识别文字")
+        corrected_entries = [dict(entry) for entry in asr_entries]
+        try:
+            matches, avg_sim, unit_sims = self._match_units_by_text_similarity(text_units, asr_units)
+        except Exception as exc:
+            self._log(f"SRT 文案修正失败，回退自动识别文字：{exc}")
+            self._write_srt_entries(dst_srt, corrected_entries)
+            return
+
+        corrected_unit_count = 0
+        corrected_entry_count = 0
+        skipped_low_conf = 0
+        used_indices: set[int] = set()
+
+        for unit_idx, match in enumerate(matches):
+            start, end = match
+            unit_sim = unit_sims[unit_idx]
+            if unit_sim < 0.42:
+                skipped_low_conf += 1
+                continue
+
+            asr_source_indices: list[int] = []
+            for asr_unit in asr_units[start:end]:
+                for src_idx in asr_unit.get("source_indices") or []:
+                    if src_idx not in used_indices:
+                        asr_source_indices.append(src_idx)
+            asr_source_indices = sorted(asr_source_indices)
+            if not asr_source_indices:
+                skipped_low_conf += 1
+                continue
+
+            replacement_chunks = self._split_text_for_reference_entries(
+                text_units[unit_idx]["text"],
+                [corrected_entries[i] for i in asr_source_indices],
+            )
+            if not replacement_chunks:
+                skipped_low_conf += 1
+                continue
+
+            replaced_here = 0
+            for src_idx, chunk in zip(asr_source_indices, replacement_chunks):
+                if not chunk.strip():
+                    continue
+                corrected_entries[src_idx]["text"] = chunk
+                used_indices.add(src_idx)
+                replaced_here += 1
+            if replaced_here == 0:
+                skipped_low_conf += 1
+                continue
+            corrected_unit_count += 1
+            corrected_entry_count += replaced_here
+
+        self._write_srt_entries(dst_srt, corrected_entries)
+        self._log(
+            "SRT 文案修正完成："
+            f"语义块 {corrected_unit_count}/{len(text_units)}，"
+            f"字幕条 {corrected_entry_count}/{len(asr_entries)}，"
+            f"平均相似度={avg_sim:.3f}，"
+            f"低置信跳过 {skipped_low_conf} 块"
+        )
 
     def _align_timeline_segmented_anchor(
         self, text_entries: list[dict], asr_entries: list[dict]
@@ -841,6 +936,123 @@ class SubtitleBurnerApp:
         if any(x is None for x in aligned):
             raise RuntimeError("分段锚点校准失败：无法完成全部字幕映射。")
         return [x for x in aligned if x is not None]
+
+    def _align_units_by_text_matching(
+        self, text_units: list[dict], asr_units: list[dict]
+    ) -> list[dict]:
+        m = len(text_units)
+        n = len(asr_units)
+        matches, avg_sim, _unit_sims = self._match_units_by_text_similarity(text_units, asr_units)
+
+        aligned_units: list[dict] = []
+        for idx, match in enumerate(matches):
+            start, end = match
+            unit_asr = asr_units[start:end]
+            aligned_units.append(
+                {
+                    "start": unit_asr[0]["start"],
+                    "end": unit_asr[-1]["end"],
+                    "text": text_units[idx]["text"],
+                }
+            )
+
+        self._log(f"文本匹配对齐完成：语义块 {m}->{n} 平均相似度={avg_sim:.3f}")
+        if avg_sim < 0.38:
+            raise RuntimeError(f"文本匹配置信度过低（{avg_sim:.3f}）。")
+        return aligned_units
+
+    def _match_units_by_text_similarity(
+        self,
+        source_units: list[dict],
+        target_units: list[dict],
+    ) -> tuple[list[tuple[int, int]], float, list[float]]:
+        if not source_units or not target_units:
+            raise RuntimeError("文本匹配失败：缺少可用语义块。")
+
+        source_norm = [self._normalize_alignment_text(x["text"]) for x in source_units]
+        target_norm = [self._normalize_alignment_text(x["text"]) for x in target_units]
+        m = len(source_units)
+        n = len(target_units)
+        max_span = 3
+        skip_penalty = 0.08
+        neg_inf = -10**9
+
+        dp = [[neg_inf] * (n + 1) for _ in range(m + 1)]
+        back: list[list[tuple[str, int] | None]] = [[None] * (n + 1) for _ in range(m + 1)]
+        for j in range(n + 1):
+            dp[0][j] = -skip_penalty * j
+
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                best_score = dp[i][j - 1] - skip_penalty
+                best_choice: tuple[str, int] | None = ("skip", 1)
+
+                for span in range(1, min(max_span, j) + 1):
+                    prev = dp[i - 1][j - span]
+                    if prev <= neg_inf / 2:
+                        continue
+                    target_joined = "".join(target_norm[j - span:j])
+                    sim = self._alignment_similarity(source_norm[i - 1], target_joined)
+                    position_penalty = abs((i / m) - (j / n)) * 0.35
+                    length_penalty = abs(len(source_norm[i - 1]) - len(target_joined)) / max(
+                        1,
+                        len(source_norm[i - 1]),
+                        len(target_joined),
+                    ) * 0.12
+                    score = prev + sim - position_penalty - length_penalty
+                    if score > best_score:
+                        best_score = score
+                        best_choice = ("match", span)
+
+                dp[i][j] = best_score
+                back[i][j] = best_choice
+
+        end_j = max(range(1, n + 1), key=lambda j: dp[m][j])
+        if dp[m][end_j] <= neg_inf / 2:
+            raise RuntimeError("文本匹配失败：未找到可用匹配路径。")
+
+        matches: list[tuple[int, int] | None] = [None] * m
+        i = m
+        j = end_j
+        while i > 0 and j >= 0:
+            choice = back[i][j]
+            if choice is None:
+                break
+            kind, step = choice
+            if kind == "skip":
+                j -= step
+                continue
+            start = j - step
+            matches[i - 1] = (start, j)
+            i -= 1
+            j = start
+
+        if any(match is None for match in matches):
+            raise RuntimeError("文本匹配失败：部分语义块未匹配到识别结果。")
+
+        resolved_matches = [match for match in matches if match is not None]
+        unit_sims: list[float] = []
+        for idx, match in enumerate(resolved_matches):
+            start, end = match
+            joined = "".join(target_norm[start:end])
+            unit_sims.append(self._alignment_similarity(source_norm[idx], joined))
+        avg_sim = sum(unit_sims) / max(1, len(unit_sims))
+        return resolved_matches, avg_sim, unit_sims
+
+    def _alignment_similarity(self, left: str, right: str) -> float:
+        if not left or not right:
+            return 0.0
+        seq_ratio = difflib.SequenceMatcher(None, left, right).ratio()
+        left_grams = self._char_ngrams(left)
+        right_grams = self._char_ngrams(right)
+        overlap = len(left_grams & right_grams) / max(1, len(left_grams | right_grams))
+        prefix_bonus = 0.08 if left[:2] and left[:2] == right[:2] else 0.0
+        return 0.65 * seq_ratio + 0.35 * overlap + prefix_bonus
+
+    def _char_ngrams(self, text: str) -> set[str]:
+        if len(text) <= 1:
+            return {text} if text else set()
+        return {text[i : i + 2] for i in range(len(text) - 1)}
 
     def _align_timeline_by_char_counts(
         self, text_entries: list[dict], asr_entries: list[dict]
@@ -929,6 +1141,110 @@ class SubtitleBurnerApp:
             entries.append({"start": start, "end": end, "text": text})
         return entries
 
+    def _collapse_entries_for_alignment(self, entries: list[dict]) -> list[dict]:
+        if not entries:
+            return []
+
+        units: list[dict] = []
+        current = {
+            "start": entries[0]["start"],
+            "end": entries[0]["end"],
+            "text_parts": [entries[0]["text"]],
+            "source_indices": [0],
+        }
+
+        for idx in range(1, len(entries)):
+            ent = entries[idx]
+            prev = entries[idx - 1]
+            gap = max(0.0, ent["start"] - prev["end"])
+            current_text = self._normalize_alignment_text("".join(current["text_parts"]))
+            should_break = (
+                self._ends_alignment_sentence(current_text)
+                or self._effective_text_len(current_text) >= 18
+                or gap >= 0.45
+            )
+            if should_break:
+                units.append(
+                    {
+                        "start": current["start"],
+                        "end": current["end"],
+                        "text": self._normalize_alignment_text("".join(current["text_parts"])),
+                        "source_indices": current["source_indices"][:],
+                    }
+                )
+                current = {
+                    "start": ent["start"],
+                    "end": ent["end"],
+                    "text_parts": [ent["text"]],
+                    "source_indices": [idx],
+                }
+            else:
+                current["end"] = ent["end"]
+                current["text_parts"].append(ent["text"])
+                current["source_indices"].append(idx)
+
+        units.append(
+            {
+                "start": current["start"],
+                "end": current["end"],
+                "text": self._normalize_alignment_text("".join(current["text_parts"])),
+                "source_indices": current["source_indices"][:],
+            }
+        )
+        return units
+
+    def _expand_aligned_units_to_entries(
+        self,
+        original_entries: list[dict],
+        align_units: list[dict],
+        aligned_units: list[dict],
+    ) -> list[dict]:
+        if len(align_units) != len(aligned_units):
+            raise RuntimeError("时间轴校准失败：语义块数量不一致。")
+
+        expanded: list[dict] = []
+        for unit, aligned_unit in zip(align_units, aligned_units):
+            indices = unit.get("source_indices") or []
+            if not indices:
+                continue
+            if len(indices) == 1:
+                src_ent = original_entries[indices[0]]
+                expanded.append(
+                    {
+                        "start": aligned_unit["start"],
+                        "end": aligned_unit["end"],
+                        "text": src_ent["text"],
+                    }
+                )
+                continue
+
+            source_entries = [original_entries[i] for i in indices]
+            unit_duration = max(TIMELINE_MIN_DURATION_FALLBACK_SEC, aligned_unit["end"] - aligned_unit["start"])
+            weights = [max(1, self._effective_text_len(ent["text"])) for ent in source_entries]
+            total_weight = max(1, sum(weights))
+            cursor = aligned_unit["start"]
+            for idx, src_ent in enumerate(source_entries):
+                if idx == len(source_entries) - 1:
+                    seg_end = aligned_unit["end"]
+                else:
+                    seg_duration = max(
+                        TIMELINE_MIN_DURATION_SEC,
+                        unit_duration * (weights[idx] / total_weight),
+                    )
+                    seg_end = min(aligned_unit["end"], cursor + seg_duration)
+                expanded.append({"start": cursor, "end": seg_end, "text": src_ent["text"]})
+                cursor = seg_end
+        return expanded
+
+    def _normalize_alignment_text(self, text: str) -> str:
+        merged = re.sub(r"\s*\n\s*", "", text)
+        merged = re.sub(r"\s+", "", merged)
+        return merged.strip(" \"'“”‘’")
+
+    def _ends_alignment_sentence(self, text: str) -> bool:
+        stripped = text.rstrip()
+        return bool(stripped) and stripped[-1] in "。！？!?；;：:"
+
     def _write_srt_entries(self, srt_path: str, entries: list[dict]):
         with open(srt_path, "w", encoding="utf-8") as f:
             for idx, ent in enumerate(entries, start=1):
@@ -958,6 +1274,10 @@ class SubtitleBurnerApp:
             if not merged:
                 continue
             chunks = self._split_text_for_single_line(merged, char_limit)
+            chunks = self._merge_short_single_line_chunks(
+                chunks,
+                max(TIMELINE_MIN_DURATION_FALLBACK_SEC, ent["end"] - ent["start"]),
+            )
             if len(chunks) <= 1:
                 flattened.append({"start": ent["start"], "end": ent["end"], "text": merged})
                 continue
@@ -988,9 +1308,104 @@ class SubtitleBurnerApp:
         merged = re.sub(r"\s+", " ", merged).strip()
         return merged
 
+    def _split_text_for_reference_entries(
+        self,
+        text: str,
+        reference_entries: list[dict],
+    ) -> list[str]:
+        merged = self._normalize_single_line_text(text)
+        if not merged:
+            return []
+        if len(reference_entries) <= 1:
+            return [merged]
+
+        weights = [max(1, self._effective_text_len(ent["text"])) for ent in reference_entries]
+        chunks: list[str] = []
+        cursor = 0
+        total_weight = sum(weights)
+
+        for idx, weight in enumerate(weights):
+            remaining_parts = len(weights) - idx
+            if idx == len(weights) - 1:
+                chunk = merged[cursor:].strip()
+                chunks.append(chunk or merged[cursor:])
+                break
+
+            remaining_weight = sum(weights[idx:])
+            visible_total = self._visible_char_count(merged[cursor:])
+            if visible_total <= remaining_parts:
+                next_cursor = min(len(merged), cursor + 1)
+            else:
+                desired_visible = max(1, int(round(visible_total * (weight / max(1, remaining_weight)))))
+                next_cursor = self._find_split_index_by_visible_chars(merged, cursor, desired_visible)
+                next_cursor = self._clamp_split_index_for_remaining_text(
+                    merged,
+                    cursor,
+                    next_cursor,
+                    remaining_parts - 1,
+                )
+
+            chunk = merged[cursor:next_cursor].strip()
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            cursor = next_cursor
+
+        while len(chunks) < len(reference_entries):
+            chunks.append("")
+        if len(chunks) > len(reference_entries):
+            head = chunks[: len(reference_entries) - 1]
+            tail = "".join(chunks[len(reference_entries) - 1 :]).strip()
+            chunks = head + [tail]
+        return chunks
+
+    def _visible_char_count(self, text: str) -> int:
+        return sum(1 for ch in text if not ch.isspace())
+
+    def _find_split_index_by_visible_chars(self, text: str, start: int, desired_visible: int) -> int:
+        visible = 0
+        exact_index = len(text)
+        for idx in range(start, len(text)):
+            if text[idx].isspace():
+                continue
+            visible += 1
+            if visible >= desired_visible:
+                exact_index = idx + 1
+                break
+
+        punct = "，。！？；、,.!?;"
+        for idx in range(exact_index, min(len(text), exact_index + 5)):
+            if text[idx] in punct:
+                return idx + 1
+        for idx in range(exact_index - 1, max(start, exact_index - 5) - 1, -1):
+            if text[idx] in punct:
+                return idx + 1
+        return exact_index
+
+    def _clamp_split_index_for_remaining_text(
+        self,
+        text: str,
+        start: int,
+        split_index: int,
+        remaining_parts: int,
+    ) -> int:
+        split_index = max(start + 1, min(len(text), split_index))
+        while split_index < len(text) and self._visible_char_count(text[split_index:]) < remaining_parts:
+            split_index -= 1
+            if split_index <= start:
+                return min(len(text), start + 1)
+        return split_index
+
     def _split_text_for_single_line(self, text: str, char_limit: int) -> list[str]:
         if self._effective_text_len(text) <= char_limit:
             return [text]
+
+        punctuated = self._split_text_by_punctuation(text)
+        if len(punctuated) > 1:
+            chunks: list[str] = []
+            for piece in punctuated:
+                chunks.extend(self._split_text_for_single_line(piece, char_limit))
+            return [chunk for chunk in chunks if chunk]
 
         chunks: list[str] = []
         current = ""
@@ -1004,6 +1419,46 @@ class SubtitleBurnerApp:
         if current.strip():
             chunks.append(current.strip())
         return [chunk for chunk in chunks if chunk]
+
+    def _split_text_by_punctuation(self, text: str) -> list[str]:
+        pieces: list[str] = []
+        current = ""
+        for char in text:
+            current += char
+            if char in "，。！？；、,.!?;":
+                pieces.append(current.strip())
+                current = ""
+        if current.strip():
+            pieces.append(current.strip())
+        return [piece for piece in pieces if piece]
+
+    def _merge_short_single_line_chunks(self, chunks: list[str], total_duration: float) -> list[str]:
+        if len(chunks) <= 1:
+            return chunks
+        avg_duration = total_duration / max(1, len(chunks))
+        if avg_duration >= SINGLE_LINE_MIN_CHUNK_DURATION_SEC:
+            return chunks
+
+        target_count = max(1, int(total_duration / SINGLE_LINE_MIN_CHUNK_DURATION_SEC))
+        target_count = min(target_count, len(chunks))
+        if target_count >= len(chunks):
+            return chunks
+
+        merged: list[str] = []
+        step = len(chunks) / target_count
+        start = 0.0
+        for idx in range(target_count):
+            end = round((idx + 1) * step)
+            if end <= int(start):
+                end = int(start) + 1
+            piece = "".join(chunks[int(start):end]).strip()
+            if piece:
+                merged.append(piece)
+            start = float(end)
+
+        if not merged:
+            return chunks
+        return merged
 
     def _compute_single_line_char_limit(
         self,
@@ -1300,9 +1755,9 @@ class SubtitleBurnerApp:
         if subtitle_style_key == "lecture":
             back_alpha = self._opacity_percent_to_ass_alpha(subtitle_box_opacity)
             style = (
-                f"FontName=Arial Bold,FontSize={font_size + 4},Bold=1,"
-                "Outline=2.6,Shadow=0,Spacing=0.2,MarginV=30,MarginL=44,MarginR=44,"
-                "Alignment=2,BorderStyle=3,WrapStyle=2,PrimaryColour=&H00FFFFFF&,"
+                f"FontName=Arial Bold,FontSize={font_size},Bold=1,"
+                "Outline=2.2,Shadow=0,Spacing=0.1,MarginV=30,MarginL=60,MarginR=60,"
+                "Alignment=2,BorderStyle=3,WrapStyle=0,PrimaryColour=&H00FFFFFF&,"
                 f"OutlineColour=&H{back_alpha}000000&,BackColour=&H{back_alpha}000000&"
             )
             escaped_style = self._escape_subtitles_filter_value(style)
