@@ -98,6 +98,7 @@ FORCE_SINGLE_LINE_CHAR_LIMIT = {
 }
 LECTURE_BOX_OPACITY_DEFAULT = 60
 SINGLE_LINE_MIN_CHUNK_DURATION_SEC = 0.9
+DEFAULT_WATERMARK_TEXT = "https://www.youtube.com/@PunkGrampsLin"
 
 
 def parse_drop_files(raw: str) -> list[str]:
@@ -128,6 +129,8 @@ class SubtitleBurnerApp:
         self.quality_mode_label = tk.StringVar(value="匹配源参数（快速推流）")
         self.custom_crf_var = tk.StringVar(value="")
         self.force_single_line_var = tk.BooleanVar(value=False)
+        self.watermark_enabled_var = tk.BooleanVar(value=True)
+        self.watermark_text_var = tk.StringVar(value=DEFAULT_WATERMARK_TEXT)
         self.auto_asr_var = tk.BooleanVar(value=False)
         self.align_timeline_var = tk.BooleanVar(value=False)
         self.fast_align_var = tk.BooleanVar(value=True)
@@ -250,6 +253,20 @@ class SubtitleBurnerApp:
             width=6,
         )
         subtitle_opacity_combo.pack(side=tk.LEFT, padx=(8, 0))
+
+        watermark_row = ttk.Frame(frame)
+        watermark_row.pack(fill=tk.X, pady=4)
+        ttk.Label(watermark_row, text="视频水印", width=18).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            watermark_row,
+            text="横屏视频加水印",
+            variable=self.watermark_enabled_var,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Entry(
+            watermark_row,
+            textvariable=self.watermark_text_var,
+            width=42,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
 
         quality_row = ttk.Frame(frame)
         quality_row.pack(fill=tk.X, pady=4)
@@ -390,6 +407,8 @@ class SubtitleBurnerApp:
         subtitle_style_key = SUBTITLE_STYLE_LABEL_TO_KEY.get(subtitle_style_label, "standard")
         subtitle_box_opacity = self._parse_subtitle_box_opacity(self.subtitle_box_opacity_var.get())
         force_single_line = self.force_single_line_var.get()
+        watermark_enabled = self.watermark_enabled_var.get()
+        watermark_text = self.watermark_text_var.get().strip()
         quality_label = self.quality_mode_label.get().strip() or "匹配源参数（快速推流）"
         quality_mode_key = QUALITY_LABEL_TO_KEY.get(quality_label, "match")
         auto_asr = self.auto_asr_var.get()
@@ -451,6 +470,8 @@ class SubtitleBurnerApp:
                 subtitle_style_key,
                 subtitle_box_opacity,
                 force_single_line,
+                watermark_enabled,
+                watermark_text,
                 quality_mode_key,
                 custom_crf,
                 auto_asr,
@@ -471,6 +492,8 @@ class SubtitleBurnerApp:
         subtitle_style_key: str,
         subtitle_box_opacity: int,
         force_single_line: bool,
+        watermark_enabled: bool,
+        watermark_text: str,
         quality_mode_key: str,
         custom_crf: str | None,
         auto_asr: bool,
@@ -525,6 +548,8 @@ class SubtitleBurnerApp:
                 subtitle_size_key,
                 subtitle_style_key,
                 subtitle_box_opacity,
+                watermark_enabled,
+                watermark_text,
                 quality_mode_key,
                 custom_crf,
             )
@@ -552,6 +577,8 @@ class SubtitleBurnerApp:
         subtitle_size_key: str,
         subtitle_style_key: str,
         subtitle_box_opacity: int,
+        watermark_enabled: bool,
+        watermark_text: str,
         quality_mode_key: str,
         custom_crf: str | None,
     ):
@@ -567,6 +594,8 @@ class SubtitleBurnerApp:
             subtitle_style_key,
             subtitle_box_opacity,
             media,
+            watermark_enabled,
+            watermark_text,
         )
         self._log(f"字幕风格：{subtitle_style_key} 底板透明度={subtitle_box_opacity}%")
         cmd = [
@@ -1732,6 +1761,16 @@ class SubtitleBurnerApp:
             .replace(",", r"\,")
         )
 
+    def _escape_drawtext_value(self, value: str) -> str:
+        return (
+            value.replace("\\", r"\\")
+            .replace(":", r"\:")
+            .replace("'", r"\'")
+            .replace(",", r"\,")
+            .replace("[", r"\[")
+            .replace("]", r"\]")
+        )
+
     def _build_subtitle_filter(
         self,
         trad_srt: str,
@@ -1739,9 +1778,12 @@ class SubtitleBurnerApp:
         subtitle_style_key: str,
         subtitle_box_opacity: int,
         media: dict | None,
+        watermark_enabled: bool,
+        watermark_text: str,
     ) -> str:
         font_size = self._compute_adaptive_font_size(subtitle_size_key, media)
         escaped_srt = self._escape_subtitles_filter_value(trad_srt)
+        filters: list[str] = []
 
         if subtitle_style_key == "bold_outline":
             style = (
@@ -1750,9 +1792,8 @@ class SubtitleBurnerApp:
                 "PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&"
             )
             escaped_style = self._escape_subtitles_filter_value(style)
-            return f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'"
-
-        if subtitle_style_key == "lecture":
+            filters.append(f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'")
+        elif subtitle_style_key == "lecture":
             back_alpha = self._opacity_percent_to_ass_alpha(subtitle_box_opacity)
             style = (
                 f"FontName=Arial Bold,FontSize={font_size},Bold=1,"
@@ -1761,14 +1802,67 @@ class SubtitleBurnerApp:
                 f"OutlineColour=&H{back_alpha}000000&,BackColour=&H{back_alpha}000000&"
             )
             escaped_style = self._escape_subtitles_filter_value(style)
-            return f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'"
+            filters.append(f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'")
+        else:
+            style = (
+                f"FontName=Arial,FontSize={font_size},Outline=1.2,Shadow=0.8,"
+                "MarginV=20,PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&"
+            )
+            escaped_style = self._escape_subtitles_filter_value(style)
+            filters.append(f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'")
 
-        style = (
-            f"FontName=Arial,FontSize={font_size},Outline=1.2,Shadow=0.8,"
-            "MarginV=20,PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&"
+        watermark_filter = self._build_watermark_filter(media, watermark_enabled, watermark_text)
+        if watermark_filter:
+            filters.append(watermark_filter)
+        return ",".join(filters)
+
+    def _build_watermark_filter(
+        self,
+        media: dict | None,
+        watermark_enabled: bool,
+        watermark_text: str,
+    ) -> str | None:
+        if not watermark_enabled:
+            self._log("水印：已关闭")
+            return None
+        if not watermark_text.strip():
+            self._log("水印：文本为空，已跳过")
+            return None
+        if not media:
+            self._log("水印：缺少媒体信息，已跳过")
+            return None
+
+        width = int(media.get("width") or 0)
+        height = int(media.get("height") or 0)
+        duration_sec = float(media.get("duration_sec") or 0.0)
+        if width <= 0 or height <= 0:
+            self._log("水印：分辨率未知，已跳过")
+            return None
+        if height > width:
+            self._log("水印：竖屏视频，已跳过")
+            return None
+
+        fontsize = max(16, min(30, int(round(width * 0.015))))
+        margin_x = max(24, int(round(width * 0.025)))
+        margin_y = max(24, int(round(height * 0.04)))
+        escaped_text = self._escape_drawtext_value(watermark_text.strip())
+        self._log(
+            f"水印：已启用（横屏视频 {width}x{height} {duration_sec/60:.1f} 分钟）"
         )
-        escaped_style = self._escape_subtitles_filter_value(style)
-        return f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'"
+        return (
+            "drawtext="
+            f"text='{escaped_text}':"
+            "expansion=none:"
+            f"fontsize={fontsize}:"
+            "fontcolor=white@0.24:"
+            "borderw=1:"
+            "bordercolor=black@0.28:"
+            "box=1:"
+            "boxcolor=black@0.10:"
+            "boxborderw=14:"
+            f"x=w-tw-{margin_x}:"
+            f"y={margin_y}"
+        )
 
     def _compute_adaptive_font_size(self, subtitle_size_key: str, media: dict | None) -> int:
         base = SUBTITLE_SIZE_MAP.get(subtitle_size_key, 24)
