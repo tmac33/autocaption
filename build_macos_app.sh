@@ -12,6 +12,8 @@ mkdir -p "$MACOS_DIR" "$RES_DIR"
 
 cp "$ROOT_DIR/app.py" "$RES_DIR/app.py"
 cp "$ROOT_DIR/assets/app.icns" "$RES_DIR/app.icns"
+rm -rf "$RES_DIR/assets"
+cp -R "$ROOT_DIR/assets" "$RES_DIR/assets"
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -70,11 +72,11 @@ fi
 
 if ! "$PY_BIN" - <<'PY' >/dev/null 2>&1
 import importlib.util
-mods = ["opencc", "tkinterdnd2", "faster_whisper"]
+mods = ["opencc", "tkinterdnd2", "faster_whisper", "PIL"]
 raise SystemExit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)
 PY
 then
-  /usr/bin/osascript -e 'display alert "依赖缺失" message "请先执行: pip3 install -r requirements.txt（或 .venv/bin/pip install -r requirements.txt）" as warning'
+  /usr/bin/osascript -e 'display alert "依赖缺失" message "请先执行: pip3 install -r requirements.txt（或 .venv/bin/pip install -r requirements.txt），确保包含 Pillow" as warning'
   exit 1
 fi
 

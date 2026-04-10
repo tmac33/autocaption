@@ -34,6 +34,13 @@ except ImportError:
     WhisperModel = None
     whisper_download_model = None
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm"}
 SUB_EXTS = {".srt"}
@@ -98,7 +105,13 @@ FORCE_SINGLE_LINE_CHAR_LIMIT = {
 }
 LECTURE_BOX_OPACITY_DEFAULT = 60
 SINGLE_LINE_MIN_CHUNK_DURATION_SEC = 0.9
-DEFAULT_WATERMARK_TEXT = "https://www.youtube.com/@PunkGrampsLin"
+DEFAULT_WATERMARK_TEXT = "www.youtube.com/@PunkGrampsLin"
+DEFAULT_SUBSCRIBE_PROMPT_TEXT = "訂閱老林:前瞻科學抗老早知道!"
+DEFAULT_SUBSCRIBE_PROMPT_OPACITY = 92
+TEXT_CORRECTION_CONFIDENT_SIM = 0.42
+TEXT_CORRECTION_SAFE_SIM = 0.24
+TEXT_CORRECTION_SAFE_LENGTH_RATIO = 1.8
+TEXT_CORRECTION_SAFE_LENGTH_DELTA = 10
 
 
 def parse_drop_files(raw: str) -> list[str]:
@@ -131,6 +144,9 @@ class SubtitleBurnerApp:
         self.force_single_line_var = tk.BooleanVar(value=False)
         self.watermark_enabled_var = tk.BooleanVar(value=True)
         self.watermark_text_var = tk.StringVar(value=DEFAULT_WATERMARK_TEXT)
+        self.subscribe_prompt_enabled_var = tk.BooleanVar(value=True)
+        self.subscribe_prompt_text_var = tk.StringVar(value=DEFAULT_SUBSCRIBE_PROMPT_TEXT)
+        self.subscribe_prompt_opacity_var = tk.StringVar(value=str(DEFAULT_SUBSCRIBE_PROMPT_OPACITY))
         self.auto_asr_var = tk.BooleanVar(value=False)
         self.align_timeline_var = tk.BooleanVar(value=False)
         self.fast_align_var = tk.BooleanVar(value=True)
@@ -267,6 +283,28 @@ class SubtitleBurnerApp:
             textvariable=self.watermark_text_var,
             width=42,
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+
+        subscribe_row = ttk.Frame(frame)
+        subscribe_row.pack(fill=tk.X, pady=4)
+        ttk.Label(subscribe_row, text="订阅提示", width=18).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            subscribe_row,
+            text="左下角浮动提示",
+            variable=self.subscribe_prompt_enabled_var,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Entry(
+            subscribe_row,
+            textvariable=self.subscribe_prompt_text_var,
+            width=34,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+        ttk.Label(subscribe_row, text="透明度", width=8).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Combobox(
+            subscribe_row,
+            textvariable=self.subscribe_prompt_opacity_var,
+            values=["40", "50", "60", "70", "80", "90", "100"],
+            state="readonly",
+            width=6,
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         quality_row = ttk.Frame(frame)
         quality_row.pack(fill=tk.X, pady=4)
@@ -409,6 +447,12 @@ class SubtitleBurnerApp:
         force_single_line = self.force_single_line_var.get()
         watermark_enabled = self.watermark_enabled_var.get()
         watermark_text = self.watermark_text_var.get().strip()
+        subscribe_prompt_enabled = self.subscribe_prompt_enabled_var.get()
+        subscribe_prompt_text = self.subscribe_prompt_text_var.get().strip()
+        subscribe_prompt_opacity = self._parse_percent_value(
+            self.subscribe_prompt_opacity_var.get(),
+            DEFAULT_SUBSCRIBE_PROMPT_OPACITY,
+        )
         quality_label = self.quality_mode_label.get().strip() or "匹配源参数（快速推流）"
         quality_mode_key = QUALITY_LABEL_TO_KEY.get(quality_label, "match")
         auto_asr = self.auto_asr_var.get()
@@ -472,6 +516,9 @@ class SubtitleBurnerApp:
                 force_single_line,
                 watermark_enabled,
                 watermark_text,
+                subscribe_prompt_enabled,
+                subscribe_prompt_text,
+                subscribe_prompt_opacity,
                 quality_mode_key,
                 custom_crf,
                 auto_asr,
@@ -494,6 +541,9 @@ class SubtitleBurnerApp:
         force_single_line: bool,
         watermark_enabled: bool,
         watermark_text: str,
+        subscribe_prompt_enabled: bool,
+        subscribe_prompt_text: str,
+        subscribe_prompt_opacity: int,
         quality_mode_key: str,
         custom_crf: str | None,
         auto_asr: bool,
@@ -550,6 +600,9 @@ class SubtitleBurnerApp:
                 subtitle_box_opacity,
                 watermark_enabled,
                 watermark_text,
+                subscribe_prompt_enabled,
+                subscribe_prompt_text,
+                subscribe_prompt_opacity,
                 quality_mode_key,
                 custom_crf,
             )
@@ -579,6 +632,9 @@ class SubtitleBurnerApp:
         subtitle_box_opacity: int,
         watermark_enabled: bool,
         watermark_text: str,
+        subscribe_prompt_enabled: bool,
+        subscribe_prompt_text: str,
+        subscribe_prompt_opacity: int,
         quality_mode_key: str,
         custom_crf: str | None,
     ):
@@ -596,6 +652,9 @@ class SubtitleBurnerApp:
             media,
             watermark_enabled,
             watermark_text,
+            subscribe_prompt_enabled,
+            subscribe_prompt_text,
+            subscribe_prompt_opacity,
         )
         self._log(f"字幕风格：{subtitle_style_key} 底板透明度={subtitle_box_opacity}%")
         cmd = [
@@ -848,16 +907,14 @@ class SubtitleBurnerApp:
 
         corrected_unit_count = 0
         corrected_entry_count = 0
+        confident_replace_count = 0
+        safe_replace_count = 0
         skipped_low_conf = 0
         used_indices: set[int] = set()
 
         for unit_idx, match in enumerate(matches):
             start, end = match
             unit_sim = unit_sims[unit_idx]
-            if unit_sim < 0.42:
-                skipped_low_conf += 1
-                continue
-
             asr_source_indices: list[int] = []
             for asr_unit in asr_units[start:end]:
                 for src_idx in asr_unit.get("source_indices") or []:
@@ -865,6 +922,15 @@ class SubtitleBurnerApp:
                         asr_source_indices.append(src_idx)
             asr_source_indices = sorted(asr_source_indices)
             if not asr_source_indices:
+                skipped_low_conf += 1
+                continue
+
+            should_replace, replace_mode = self._should_apply_reference_text(
+                text_units[unit_idx]["text"],
+                [corrected_entries[i] for i in asr_source_indices],
+                unit_sim,
+            )
+            if not should_replace:
                 skipped_low_conf += 1
                 continue
 
@@ -888,6 +954,10 @@ class SubtitleBurnerApp:
                 continue
             corrected_unit_count += 1
             corrected_entry_count += replaced_here
+            if replace_mode == "confident":
+                confident_replace_count += 1
+            else:
+                safe_replace_count += 1
 
         self._write_srt_entries(dst_srt, corrected_entries)
         self._log(
@@ -895,6 +965,8 @@ class SubtitleBurnerApp:
             f"语义块 {corrected_unit_count}/{len(text_units)}，"
             f"字幕条 {corrected_entry_count}/{len(asr_entries)}，"
             f"平均相似度={avg_sim:.3f}，"
+            f"高置信替换 {confident_replace_count} 块，"
+            f"保守替换 {safe_replace_count} 块，"
             f"低置信跳过 {skipped_low_conf} 块"
         )
 
@@ -1388,6 +1460,30 @@ class SubtitleBurnerApp:
             chunks = head + [tail]
         return chunks
 
+    def _should_apply_reference_text(
+        self,
+        source_text: str,
+        target_entries: list[dict],
+        similarity: float,
+    ) -> tuple[bool, str]:
+        if similarity >= TEXT_CORRECTION_CONFIDENT_SIM:
+            return True, "confident"
+        if similarity < TEXT_CORRECTION_SAFE_SIM:
+            return False, "skip"
+
+        source_norm = self._normalize_alignment_text(source_text)
+        target_norm = self._normalize_alignment_text("".join(ent["text"] for ent in target_entries))
+        source_len = max(1, self._effective_text_len(source_norm))
+        target_len = max(1, self._effective_text_len(target_norm))
+        length_ratio = max(source_len, target_len) / max(1, min(source_len, target_len))
+        length_delta = abs(source_len - target_len)
+        if (
+            length_ratio <= TEXT_CORRECTION_SAFE_LENGTH_RATIO
+            and length_delta <= TEXT_CORRECTION_SAFE_LENGTH_DELTA
+        ):
+            return True, "safe"
+        return False, "skip"
+
     def _visible_char_count(self, text: str) -> int:
         return sum(1 for ch in text if not ch.isspace())
 
@@ -1771,6 +1867,195 @@ class SubtitleBurnerApp:
             .replace("]", r"\]")
         )
 
+    def _escape_filter_path(self, value: str) -> str:
+        return (
+            value.replace("\\", r"\\")
+            .replace(":", r"\:")
+            .replace("'", r"\'")
+            .replace(",", r"\,")
+            .replace("[", r"\[")
+            .replace("]", r"\]")
+        )
+
+    def _resolve_drawtext_fontfile(self, kind: str = "cjk") -> str | None:
+        if kind == "youtube":
+            candidates = [
+                "/Library/Fonts/Roboto-Bold.ttf",
+                "/Library/Fonts/Roboto-Regular.ttf",
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "/Library/Fonts/Arial Unicode.ttf",
+                "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                "/System/Library/Fonts/STHeiti Medium.ttc",
+                "/System/Library/Fonts/STHeiti Light.ttc",
+            ]
+        else:
+            candidates = [
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "/Library/Fonts/Arial Unicode.ttf",
+                "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                "/System/Library/Fonts/STHeiti Medium.ttc",
+                "/System/Library/Fonts/STHeiti Light.ttc",
+            ]
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _resolve_asset_path(self, *parts: str) -> Path | None:
+        base_dir = Path(__file__).resolve().parent
+        candidates = [
+            base_dir.joinpath(*parts),
+            base_dir.parent.joinpath(*parts),
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _create_subscribe_prompt_badge(
+        self,
+        text: str,
+        fontfile: str,
+        fontsize: int,
+        opacity: int,
+    ) -> dict[str, int | str] | None:
+        if Image is None or ImageDraw is None or ImageFont is None:
+            self._log("订阅提示：缺少 Pillow，回退普通矩形底板。")
+            return None
+
+        icon_path = self._resolve_asset_path("assets", "subscribe_bell.png")
+        icon = None
+        icon_size = max(22, min(40, int(round(fontsize * 1.20))))
+        if icon_path and icon_path.is_file():
+            try:
+                icon = Image.open(icon_path).convert("RGBA").resize((icon_size, icon_size))
+            except Exception:
+                icon = None
+
+        try:
+            font = ImageFont.truetype(fontfile, fontsize)
+        except Exception:
+            font = ImageFont.load_default()
+
+        measure = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+        measure_draw = ImageDraw.Draw(measure)
+        text_bbox = measure_draw.textbbox((0, 0), text, font=font, stroke_width=1)
+        text_width = max(1, text_bbox[2] - text_bbox[0])
+        text_height = max(1, text_bbox[3] - text_bbox[1])
+
+        pad_x = max(20, int(round(fontsize * 0.82)))
+        pad_y = max(12, int(round(fontsize * 0.52)))
+        gap = max(12, int(round(fontsize * 0.45))) if icon is not None else 0
+        icon_block_width = icon_size + gap if icon is not None else 0
+        text_area_width = text_width + max(24, int(round(fontsize * 0.95)))
+        badge_width = pad_x * 2 + icon_block_width + text_area_width
+        badge_height = max(text_height, icon_size if icon is not None else 0) + pad_y * 2
+        radius = max(10, int(round(badge_height * 0.22)))
+
+        badge = self._create_glass_badge_image(
+            badge_width,
+            badge_height,
+            radius,
+            (220, 27, 35),
+            opacity,
+            border_alpha=110,
+            highlight_alpha=88,
+            shadow_alpha=36,
+        )
+        if icon is not None:
+            icon_y = (badge_height - icon_size) // 2
+            icon_x = pad_x
+            badge.alpha_composite(icon, (icon_x, icon_y))
+            text_area_x = icon_x + icon_block_width
+        else:
+            text_area_x = pad_x
+
+        fd, out_path = tempfile.mkstemp(prefix="subscribe_prompt_badge_", suffix=".png")
+        os.close(fd)
+        badge.save(out_path)
+        return {
+            "path": out_path,
+            "width": badge_width,
+            "height": badge_height,
+            "text_area_x": text_area_x,
+            "text_area_width": text_area_width,
+        }
+
+    def _create_text_badge(
+        self,
+        text: str,
+        fontfile: str,
+        fontsize: int,
+        opacity: int,
+        fill_rgba: tuple[int, int, int],
+    ) -> dict[str, int | str] | None:
+        if Image is None or ImageDraw is None or ImageFont is None:
+            return None
+
+        try:
+            font = ImageFont.truetype(fontfile, fontsize)
+        except Exception:
+            font = ImageFont.load_default()
+
+        measure = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+        measure_draw = ImageDraw.Draw(measure)
+        text_bbox = measure_draw.textbbox((0, 0), text, font=font, stroke_width=1)
+        text_width = max(1, text_bbox[2] - text_bbox[0])
+        text_height = max(1, text_bbox[3] - text_bbox[1])
+
+        pad_x = max(18, int(round(fontsize * 0.72)))
+        pad_y = max(10, int(round(fontsize * 0.42)))
+        badge_width = pad_x * 2 + text_width
+        badge_height = text_height + pad_y * 2
+        radius = max(8, int(round(badge_height * 0.22)))
+
+        badge = self._create_glass_badge_image(
+            badge_width,
+            badge_height,
+            radius,
+            fill_rgba,
+            opacity,
+            border_alpha=95,
+            highlight_alpha=74,
+            shadow_alpha=28,
+        )
+        text_x = (badge_width - text_width) // 2 - text_bbox[0]
+        text_y = (badge_height - text_height) // 2 - text_bbox[1]
+
+        fd, out_path = tempfile.mkstemp(prefix="text_badge_", suffix=".png")
+        os.close(fd)
+        badge.save(out_path)
+        return {
+            "path": out_path,
+            "width": badge_width,
+            "height": badge_height,
+            "text_x": text_x,
+            "text_y": text_y,
+        }
+
+    def _create_glass_badge_image(
+        self,
+        width: int,
+        height: int,
+        radius: int,
+        base_rgb: tuple[int, int, int],
+        opacity: int,
+        border_alpha: int,
+        highlight_alpha: int,
+        shadow_alpha: int,
+    ):
+        alpha = int(round(max(0, min(100, opacity)) / 100 * 255))
+        badge = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(badge)
+        draw.rounded_rectangle(
+            (0, 0, width - 1, height - 1),
+            radius=radius,
+            fill=(*base_rgb, alpha),
+            outline=(255, 255, 255, border_alpha),
+            width=1,
+        )
+        return badge
+
     def _build_subtitle_filter(
         self,
         trad_srt: str,
@@ -1780,10 +2065,12 @@ class SubtitleBurnerApp:
         media: dict | None,
         watermark_enabled: bool,
         watermark_text: str,
+        subscribe_prompt_enabled: bool,
+        subscribe_prompt_text: str,
+        subscribe_prompt_opacity: int,
     ) -> str:
         font_size = self._compute_adaptive_font_size(subtitle_size_key, media)
         escaped_srt = self._escape_subtitles_filter_value(trad_srt)
-        filters: list[str] = []
 
         if subtitle_style_key == "bold_outline":
             style = (
@@ -1792,7 +2079,7 @@ class SubtitleBurnerApp:
                 "PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&"
             )
             escaped_style = self._escape_subtitles_filter_value(style)
-            filters.append(f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'")
+            subtitle_filter = f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'"
         elif subtitle_style_key == "lecture":
             back_alpha = self._opacity_percent_to_ass_alpha(subtitle_box_opacity)
             style = (
@@ -1802,26 +2089,77 @@ class SubtitleBurnerApp:
                 f"OutlineColour=&H{back_alpha}000000&,BackColour=&H{back_alpha}000000&"
             )
             escaped_style = self._escape_subtitles_filter_value(style)
-            filters.append(f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'")
+            subtitle_filter = f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'"
         else:
             style = (
                 f"FontName=Arial,FontSize={font_size},Outline=1.2,Shadow=0.8,"
                 "MarginV=20,PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&"
             )
             escaped_style = self._escape_subtitles_filter_value(style)
-            filters.append(f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'")
+            subtitle_filter = f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'"
 
-        watermark_filter = self._build_watermark_filter(media, watermark_enabled, watermark_text)
-        if watermark_filter:
-            filters.append(watermark_filter)
-        return ",".join(filters)
+        watermark = self._build_watermark_filter(media, watermark_enabled, watermark_text)
+        subscribe_prompt = self._build_subscribe_prompt_filter(
+            media,
+            subscribe_prompt_enabled,
+            subscribe_prompt_text,
+            subscribe_prompt_opacity,
+        )
+
+        if not watermark and not subscribe_prompt:
+            return subtitle_filter
+
+        segments: list[str] = [f"{subtitle_filter}[v0]"]
+        current_label = "v0"
+        next_index = 1
+
+        def append_intermediate(filter_str: str, final_stage: bool = False) -> None:
+            nonlocal current_label, next_index
+            if final_stage:
+                final_filter = filter_str.replace("[{output_label}]", "")
+                segments.append(final_filter.format(input_label=current_label, output_label=""))
+                return
+            output_label = f"v{next_index}"
+            segments.append(filter_str.format(input_label=current_label, output_label=output_label))
+            current_label = output_label
+            next_index += 1
+
+        def append_text(filter_str: str, final_stage: bool) -> None:
+            nonlocal current_label, next_index
+            if not filter_str:
+                return
+            if final_stage:
+                segments.append(f"[{current_label}]{filter_str}")
+                return
+            output_label = f"v{next_index}"
+            segments.append(f"[{current_label}]{filter_str}[{output_label}]")
+            current_label = output_label
+            next_index += 1
+
+        if watermark:
+            if watermark.get("overlay_filter"):
+                append_intermediate(
+                    watermark["overlay_filter"],
+                    final_stage=not watermark.get("text_filter") and subscribe_prompt is None,
+                )
+            append_text(watermark["text_filter"], final_stage=subscribe_prompt is None)
+
+        if subscribe_prompt:
+            if subscribe_prompt.get("icon_filter"):
+                append_intermediate(
+                    subscribe_prompt["icon_filter"],
+                    final_stage=not subscribe_prompt.get("text_filter"),
+                )
+            append_text(subscribe_prompt["text_filter"], final_stage=True)
+
+        return ";".join(segments)
 
     def _build_watermark_filter(
         self,
         media: dict | None,
         watermark_enabled: bool,
         watermark_text: str,
-    ) -> str | None:
+    ) -> dict[str, str] | None:
         if not watermark_enabled:
             self._log("水印：已关闭")
             return None
@@ -1846,23 +2184,126 @@ class SubtitleBurnerApp:
         margin_x = max(24, int(round(width * 0.025)))
         margin_y = max(24, int(round(height * 0.04)))
         escaped_text = self._escape_drawtext_value(watermark_text.strip())
+        text_fontfile = self._resolve_drawtext_fontfile("youtube") or self._resolve_drawtext_fontfile("cjk")
+        if not text_fontfile:
+            self._log("水印：未找到可用字体，已跳过")
+            return None
+        escaped_text_fontfile = self._escape_drawtext_value(text_fontfile)
         self._log(
             f"水印：已启用（横屏视频 {width}x{height} {duration_sec/60:.1f} 分钟）"
         )
-        return (
+        self._log("水印：使用纯文字样式。")
+        text_filter = (
             "drawtext="
             f"text='{escaped_text}':"
+            f"fontfile='{escaped_text_fontfile}':"
             "expansion=none:"
             f"fontsize={fontsize}:"
-            "fontcolor=white@0.24:"
-            "borderw=1:"
-            "bordercolor=black@0.28:"
-            "box=1:"
-            "boxcolor=black@0.10:"
-            "boxborderw=14:"
+            "fontcolor=white@0.30:"
+            "borderw=0.8:"
+            "bordercolor=black@0.22:"
             f"x=w-tw-{margin_x}:"
             f"y={margin_y}"
         )
+        return {"text_filter": text_filter, "overlay_filter": ""}
+
+    def _build_subscribe_prompt_filter(
+        self,
+        media: dict | None,
+        subscribe_prompt_enabled: bool,
+        subscribe_prompt_text: str,
+        subscribe_prompt_opacity: int,
+    ) -> dict[str, str] | None:
+        if not subscribe_prompt_enabled:
+            self._log("订阅提示：已关闭")
+            return None
+        if not subscribe_prompt_text.strip():
+            self._log("订阅提示：文本为空，已跳过")
+            return None
+        if not media:
+            self._log("订阅提示：缺少媒体信息，已跳过")
+            return None
+
+        width = int(media.get("width") or 0)
+        height = int(media.get("height") or 0)
+        if width <= 0 or height <= 0:
+            self._log("订阅提示：分辨率未知，已跳过")
+            return None
+
+        fontsize = max(16, min(30, int(round(width * 0.015))))
+        margin_x = max(24, int(round(width * 0.025)))
+        margin_y = max(24, int(round(height * 0.04)))
+        float_amplitude = max(6, int(round(height * 0.007)))
+        escaped_text = self._escape_drawtext_value(subscribe_prompt_text.strip())
+        text_fontfile = self._resolve_drawtext_fontfile("youtube")
+        if not text_fontfile:
+            self._log("订阅提示：未找到可用中文字体，已跳过")
+            return None
+        escaped_text_fontfile = self._escape_drawtext_value(text_fontfile)
+        self._log(
+            "订阅提示：已启用（左下角，圆角红色标签，每10秒出现5秒）"
+            f" 透明度={subscribe_prompt_opacity}%"
+        )
+        badge = self._create_subscribe_prompt_badge(
+            subscribe_prompt_text.strip(),
+            text_fontfile,
+            fontsize,
+            subscribe_prompt_opacity,
+        )
+        enable_expr = "lt(mod(t\\,10)\\,5)"
+        if not badge:
+            self._log("订阅提示：圆角底板生成失败，回退普通矩形底板。")
+            prompt_alpha = self._opacity_percent_to_drawtext_alpha(subscribe_prompt_opacity)
+            y_expr = f"h-th-{margin_y}+{float_amplitude}*sin(2*PI*t/2.4)"
+            text_filter = (
+                "drawtext="
+                f"text='{escaped_text}':"
+                f"fontfile='{escaped_text_fontfile}':"
+                "expansion=none:"
+                f"fontsize={fontsize}:"
+                "fontcolor=white@0.98:"
+                "borderw=1.0:"
+                "bordercolor=white@0.22:"
+                "box=1:"
+                f"boxcolor=red@{prompt_alpha}:"
+                "boxborderw=14:"
+                f"x={margin_x}:"
+                f"y={y_expr}:"
+                f"enable='{enable_expr}'"
+            )
+            return {"text_filter": text_filter, "icon_filter": ""}
+
+        self._log("订阅提示：使用圆角 PNG 底板。")
+        badge_path = self._escape_filter_path(str(badge["path"]))
+        badge_height = int(badge["height"])
+        text_area_x = int(badge["text_area_x"])
+        text_area_width = int(badge["text_area_width"])
+        text_x = f"{margin_x + text_area_x}+({text_area_width}-tw)/2"
+        text_y = (
+            f"h-{badge_height}-{margin_y}+({badge_height}-th)/2"
+            f"+{float_amplitude}*sin(2*PI*t/2.4)"
+        )
+        badge_filter = (
+            f"movie='{badge_path}',format=rgba[subscribe_badge];"
+            f"[{{input_label}}][subscribe_badge]overlay="
+            f"x={margin_x}:"
+            f"y=H-h-{margin_y}+{float_amplitude}*sin(2*PI*t/2.4):"
+            f"enable='{enable_expr}'[{{output_label}}]"
+        )
+        text_filter = (
+            "drawtext="
+            f"text='{escaped_text}':"
+            f"fontfile='{escaped_text_fontfile}':"
+            "expansion=none:"
+            f"fontsize={fontsize}:"
+            "fontcolor=white@0.98:"
+            "borderw=0.8:"
+            "bordercolor=black@0.14:"
+            f"x={text_x}:"
+            f"y={text_y}:"
+            f"enable='{enable_expr}'"
+        )
+        return {"text_filter": text_filter, "icon_filter": badge_filter}
 
     def _compute_adaptive_font_size(self, subtitle_size_key: str, media: dict | None) -> int:
         base = SUBTITLE_SIZE_MAP.get(subtitle_size_key, 24)
@@ -1897,6 +2338,16 @@ class SubtitleBurnerApp:
         except (TypeError, ValueError):
             return LECTURE_BOX_OPACITY_DEFAULT
         return max(0, min(100, value))
+
+    def _parse_percent_value(self, raw: str, fallback: int) -> int:
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return fallback
+        return max(0, min(100, value))
+
+    def _opacity_percent_to_drawtext_alpha(self, opacity_percent: int) -> str:
+        return f"{max(0, min(100, opacity_percent)) / 100:.2f}"
 
     def _opacity_percent_to_ass_alpha(self, opacity_percent: int) -> str:
         opacity = max(0, min(100, opacity_percent))
