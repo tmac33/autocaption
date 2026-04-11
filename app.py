@@ -112,6 +112,28 @@ TEXT_CORRECTION_CONFIDENT_SIM = 0.42
 TEXT_CORRECTION_SAFE_SIM = 0.24
 TEXT_CORRECTION_SAFE_LENGTH_RATIO = 1.8
 TEXT_CORRECTION_SAFE_LENGTH_DELTA = 10
+TEXT_CORRECTION_TERM_MAX_CHARS = 6
+TEXT_CORRECTION_PREFERRED_TERM_MAX_CHARS = 10
+TEXT_CORRECTION_PUNCT_INSERT_MAX_CHARS = 2
+TEXT_CORRECTION_LOG_SAMPLE_LIMIT = 8
+BUILTIN_PREFERRED_TERMS = [
+    "牙周",
+    "牙龈",
+    "髋关节",
+    "膝关节",
+    "关节炎",
+    "骨质疏松",
+    "阿尔茨海默",
+    "血糖",
+    "胰岛素",
+    "胆固醇",
+    "高血压",
+    "前列腺",
+    "心血管",
+    "抗老",
+    "科学抗老",
+    "老林",
+]
 
 
 def parse_drop_files(raw: str) -> list[str]:
@@ -211,7 +233,7 @@ class SubtitleBurnerApp:
         ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Checkbutton(
             asr_row,
-            text="使用提供的SRT修正自动识别文字（保留自动时间轴）",
+            text="使用提供的SRT做术语纠错（保留自动时间轴）",
             variable=self.align_timeline_var,
         ).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Checkbutton(
@@ -887,7 +909,7 @@ class SubtitleBurnerApp:
 
         t_count = len(text_entries)
         a_count = len(asr_entries)
-        self._log(f"修正文案：提供SRT {t_count} 条，自动识别 {a_count} 条")
+        self._log(f"术语纠错：提供SRT {t_count} 条，自动识别 {a_count} 条")
 
         text_units = self._collapse_entries_for_alignment(text_entries)
         asr_units = self._collapse_entries_for_alignment(asr_entries)
@@ -896,7 +918,7 @@ class SubtitleBurnerApp:
         if len(asr_units) != len(asr_entries):
             self._log(f"ASR 预处理：已将 {a_count} 条识别字幕合并为 {len(asr_units)} 个语义块")
 
-        self._log("修正策略：保留自动时间轴，用提供的SRT修正自动识别文字")
+        self._log("修正策略：保留自动时间轴，用提供的SRT做术语/短语级纠错")
         corrected_entries = [dict(entry) for entry in asr_entries]
         try:
             matches, avg_sim, unit_sims = self._match_units_by_text_similarity(text_units, asr_units)
@@ -909,8 +931,10 @@ class SubtitleBurnerApp:
         corrected_entry_count = 0
         confident_replace_count = 0
         safe_replace_count = 0
+        corrected_term_count = 0
         skipped_low_conf = 0
         used_indices: set[int] = set()
+        correction_samples: list[str] = []
 
         for unit_idx, match in enumerate(matches):
             start, end = match
@@ -946,9 +970,20 @@ class SubtitleBurnerApp:
             for src_idx, chunk in zip(asr_source_indices, replacement_chunks):
                 if not chunk.strip():
                     continue
-                corrected_entries[src_idx]["text"] = chunk
+                merged_text, term_count, samples = self._merge_reference_text_conservatively(
+                    corrected_entries[src_idx]["text"],
+                    chunk,
+                )
+                if merged_text == corrected_entries[src_idx]["text"]:
+                    continue
+                corrected_entries[src_idx]["text"] = merged_text
                 used_indices.add(src_idx)
                 replaced_here += 1
+                corrected_term_count += term_count
+                for sample in samples:
+                    if len(correction_samples) >= TEXT_CORRECTION_LOG_SAMPLE_LIMIT:
+                        break
+                    correction_samples.append(sample)
             if replaced_here == 0:
                 skipped_low_conf += 1
                 continue
@@ -967,8 +1002,11 @@ class SubtitleBurnerApp:
             f"平均相似度={avg_sim:.3f}，"
             f"高置信替换 {confident_replace_count} 块，"
             f"保守替换 {safe_replace_count} 块，"
+            f"术语纠错 {corrected_term_count} 处，"
             f"低置信跳过 {skipped_low_conf} 块"
         )
+        if correction_samples:
+            self._log("术语纠错样例：" + "；".join(correction_samples))
 
     def _align_timeline_segmented_anchor(
         self, text_entries: list[dict], asr_entries: list[dict]
@@ -1484,6 +1522,82 @@ class SubtitleBurnerApp:
             return True, "safe"
         return False, "skip"
 
+    def _merge_reference_text_conservatively(
+        self, asr_text: str, reference_text: str
+    ) -> tuple[str, int, list[str]]:
+        source = self._normalize_single_line_text(asr_text)
+        target = self._normalize_single_line_text(reference_text)
+        if not source or not target:
+            return source or asr_text, 0, []
+
+        matcher = difflib.SequenceMatcher(None, source, target)
+        chunks: list[str] = []
+        replace_count = 0
+        samples: list[str] = []
+
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            src_seg = source[i1:i2]
+            tgt_seg = target[j1:j2]
+            if tag == "equal":
+                chunks.append(src_seg)
+                continue
+            if tag == "replace":
+                if self._should_replace_text_segment(src_seg, tgt_seg):
+                    chunks.append(tgt_seg)
+                    replace_count += 1
+                    if src_seg.strip() and tgt_seg.strip() and src_seg != tgt_seg:
+                        samples.append(f"{src_seg}->{tgt_seg}")
+                else:
+                    chunks.append(src_seg)
+                continue
+            if tag == "delete":
+                chunks.append(src_seg)
+                continue
+            if tag == "insert":
+                if self._is_small_punctuation_insert(tgt_seg):
+                    chunks.append(tgt_seg)
+                    replace_count += 1
+                continue
+
+        merged = "".join(chunks).strip()
+        if not merged:
+            return source, 0, []
+        return merged, replace_count, samples[:TEXT_CORRECTION_LOG_SAMPLE_LIMIT]
+
+    def _should_replace_text_segment(self, source_segment: str, target_segment: str) -> bool:
+        source = self._normalize_alignment_text(source_segment)
+        target = self._normalize_alignment_text(target_segment)
+        if not source or not target:
+            return False
+
+        source_len = self._effective_text_len(source)
+        target_len = self._effective_text_len(target)
+        if source_len == 0 or target_len == 0:
+            return False
+
+        max_chars = TEXT_CORRECTION_TERM_MAX_CHARS
+        max_delta = 2
+        if self._contains_preferred_term(target):
+            max_chars = TEXT_CORRECTION_PREFERRED_TERM_MAX_CHARS
+            max_delta = 3
+
+        if max(source_len, target_len) > max_chars:
+            return False
+        if abs(source_len - target_len) > max_delta:
+            return False
+        return True
+
+    def _is_small_punctuation_insert(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if len(stripped) > TEXT_CORRECTION_PUNCT_INSERT_MAX_CHARS:
+            return False
+        return all(ch in "，。！？；：、,.!?;:()（）“”‘’\"' " for ch in stripped)
+
+    def _contains_preferred_term(self, text: str) -> bool:
+        return any(term in text for term in BUILTIN_PREFERRED_TERMS)
+
     def _visible_char_count(self, text: str) -> int:
         return sum(1 for ch in text if not ch.isspace())
 
@@ -1901,6 +2015,20 @@ class SubtitleBurnerApp:
                 return candidate
         return None
 
+    def _resolve_subtitle_font_name(self, bold: bool = False) -> str:
+        candidates = [
+            ("/System/Library/Fonts/Hiragino Sans GB.ttc", "Hiragino Sans GB"),
+            ("/System/Library/Fonts/STHeiti Medium.ttc", "STHeiti"),
+            ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf", "Arial Unicode MS"),
+            ("/Library/Fonts/Arial Unicode.ttf", "Arial Unicode MS"),
+        ]
+        for path, family in candidates:
+            if os.path.isfile(path):
+                if bold and family == "Hiragino Sans GB":
+                    return "Hiragino Sans GB W6"
+                return family
+        return "Arial" if not bold else "Arial Bold"
+
     def _resolve_asset_path(self, *parts: str) -> Path | None:
         base_dir = Path(__file__).resolve().parent
         candidates = [
@@ -2071,10 +2199,12 @@ class SubtitleBurnerApp:
     ) -> str:
         font_size = self._compute_adaptive_font_size(subtitle_size_key, media)
         escaped_srt = self._escape_subtitles_filter_value(trad_srt)
+        subtitle_font = self._resolve_subtitle_font_name()
+        subtitle_font_bold = self._resolve_subtitle_font_name(bold=True)
 
         if subtitle_style_key == "bold_outline":
             style = (
-                f"FontName=Arial Bold,FontSize={font_size + 4},Bold=1,"
+                f"FontName={subtitle_font_bold},FontSize={font_size + 4},Bold=1,"
                 "Outline=2.2,Shadow=0.2,Spacing=0.4,MarginV=24,"
                 "PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&"
             )
@@ -2083,7 +2213,7 @@ class SubtitleBurnerApp:
         elif subtitle_style_key == "lecture":
             back_alpha = self._opacity_percent_to_ass_alpha(subtitle_box_opacity)
             style = (
-                f"FontName=Arial Bold,FontSize={font_size},Bold=1,"
+                f"FontName={subtitle_font_bold},FontSize={font_size},Bold=1,"
                 "Outline=2.2,Shadow=0,Spacing=0.1,MarginV=30,MarginL=60,MarginR=60,"
                 "Alignment=2,BorderStyle=3,WrapStyle=0,PrimaryColour=&H00FFFFFF&,"
                 f"OutlineColour=&H{back_alpha}000000&,BackColour=&H{back_alpha}000000&"
@@ -2092,7 +2222,7 @@ class SubtitleBurnerApp:
             subtitle_filter = f"subtitles=filename='{escaped_srt}':force_style='{escaped_style}'"
         else:
             style = (
-                f"FontName=Arial,FontSize={font_size},Outline=1.2,Shadow=0.8,"
+                f"FontName={subtitle_font},FontSize={font_size},Outline=1.2,Shadow=0.8,"
                 "MarginV=20,PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&"
             )
             escaped_style = self._escape_subtitles_filter_value(style)
