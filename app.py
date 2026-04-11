@@ -114,8 +114,12 @@ TEXT_CORRECTION_SAFE_LENGTH_RATIO = 1.8
 TEXT_CORRECTION_SAFE_LENGTH_DELTA = 10
 TEXT_CORRECTION_TERM_MAX_CHARS = 6
 TEXT_CORRECTION_PREFERRED_TERM_MAX_CHARS = 10
+TEXT_CORRECTION_PHRASE_MAX_CHARS = 12
+TEXT_CORRECTION_PHRASE_MIN_SIM = 0.58
 TEXT_CORRECTION_PUNCT_INSERT_MAX_CHARS = 2
 TEXT_CORRECTION_LOG_SAMPLE_LIMIT = 8
+TEXT_CORRECTION_INTRO_STABLE_SEC = 8.0
+TEXT_CORRECTION_INTRO_SHORT_CHARS = 6
 BUILTIN_PREFERRED_TERMS = [
     "牙周",
     "牙龈",
@@ -933,6 +937,7 @@ class SubtitleBurnerApp:
         safe_replace_count = 0
         corrected_term_count = 0
         skipped_low_conf = 0
+        intro_stabilized_skip_count = 0
         used_indices: set[int] = set()
         correction_samples: list[str] = []
 
@@ -970,6 +975,9 @@ class SubtitleBurnerApp:
             for src_idx, chunk in zip(asr_source_indices, replacement_chunks):
                 if not chunk.strip():
                     continue
+                if self._should_skip_intro_correction(corrected_entries[src_idx], unit_sim, replace_mode):
+                    intro_stabilized_skip_count += 1
+                    continue
                 merged_text, term_count, samples = self._merge_reference_text_conservatively(
                     corrected_entries[src_idx]["text"],
                     chunk,
@@ -1003,6 +1011,7 @@ class SubtitleBurnerApp:
             f"高置信替换 {confident_replace_count} 块，"
             f"保守替换 {safe_replace_count} 块，"
             f"术语纠错 {corrected_term_count} 处，"
+            f"开头稳态跳过 {intro_stabilized_skip_count} 条，"
             f"低置信跳过 {skipped_low_conf} 块"
         )
         if correction_samples:
@@ -1564,6 +1573,22 @@ class SubtitleBurnerApp:
             return source, 0, []
         return merged, replace_count, samples[:TEXT_CORRECTION_LOG_SAMPLE_LIMIT]
 
+    def _should_skip_intro_correction(
+        self,
+        entry: dict,
+        unit_similarity: float,
+        replace_mode: str,
+    ) -> bool:
+        start_sec = float(entry.get("start") or 0.0)
+        if start_sec >= TEXT_CORRECTION_INTRO_STABLE_SEC:
+            return False
+        text_len = self._effective_text_len(entry.get("text", ""))
+        if text_len > TEXT_CORRECTION_INTRO_SHORT_CHARS:
+            return False
+        if replace_mode == "confident" and unit_similarity >= max(TEXT_CORRECTION_CONFIDENT_SIM, 0.56):
+            return False
+        return True
+
     def _should_replace_text_segment(self, source_segment: str, target_segment: str) -> bool:
         source = self._normalize_alignment_text(source_segment)
         target = self._normalize_alignment_text(target_segment)
@@ -1580,6 +1605,11 @@ class SubtitleBurnerApp:
         if self._contains_preferred_term(target):
             max_chars = TEXT_CORRECTION_PREFERRED_TERM_MAX_CHARS
             max_delta = 3
+
+        seg_sim = difflib.SequenceMatcher(None, source, target).ratio()
+        if max(source_len, target_len) <= TEXT_CORRECTION_PHRASE_MAX_CHARS and seg_sim >= TEXT_CORRECTION_PHRASE_MIN_SIM:
+            if abs(source_len - target_len) <= max(3, max_delta):
+                return True
 
         if max(source_len, target_len) > max_chars:
             return False
