@@ -2032,6 +2032,16 @@ class SubtitleBurnerApp:
                 "/System/Library/Fonts/STHeiti Medium.ttc",
                 "/System/Library/Fonts/STHeiti Light.ttc",
             ]
+        elif kind == "subscribe":
+            candidates = [
+                "/Library/Fonts/Roboto-Bold.ttf",
+                "/System/Library/Fonts/STHeiti Medium.ttc",
+                "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "/Library/Fonts/Arial Unicode.ttf",
+                "/Library/Fonts/Roboto-Regular.ttf",
+                "/System/Library/Fonts/STHeiti Light.ttc",
+            ]
         else:
             candidates = [
                 "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
@@ -2097,7 +2107,7 @@ class SubtitleBurnerApp:
 
         measure = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
         measure_draw = ImageDraw.Draw(measure)
-        text_bbox = measure_draw.textbbox((0, 0), text, font=font, stroke_width=1)
+        text_bbox = measure_draw.textbbox((0, 0), text, font=font, stroke_width=2)
         text_width = max(1, text_bbox[2] - text_bbox[0])
         text_height = max(1, text_bbox[3] - text_bbox[1])
 
@@ -2105,7 +2115,7 @@ class SubtitleBurnerApp:
         pad_y = max(12, int(round(fontsize * 0.52)))
         gap = max(12, int(round(fontsize * 0.45))) if icon is not None else 0
         icon_block_width = icon_size + gap if icon is not None else 0
-        text_area_width = text_width + max(24, int(round(fontsize * 0.95)))
+        text_area_width = text_width + max(34, int(round(fontsize * 1.25)))
         badge_width = pad_x * 2 + icon_block_width + text_area_width
         badge_height = max(text_height, icon_size if icon is not None else 0) + pad_y * 2
         radius = max(10, int(round(badge_height * 0.22)))
@@ -2390,18 +2400,18 @@ class SubtitleBurnerApp:
             self._log("订阅提示：分辨率未知，已跳过")
             return None
 
-        fontsize = max(16, min(30, int(round(width * 0.015))))
+        fontsize = max(18, min(36, int(round(width * 0.018))))
         margin_x = max(24, int(round(width * 0.025)))
-        margin_y = max(24, int(round(height * 0.04)))
         float_amplitude = max(6, int(round(height * 0.007)))
+        safe_bottom_offset = float_amplitude
         escaped_text = self._escape_drawtext_value(subscribe_prompt_text.strip())
-        text_fontfile = self._resolve_drawtext_fontfile("youtube")
+        text_fontfile = self._resolve_drawtext_fontfile("subscribe")
         if not text_fontfile:
             self._log("订阅提示：未找到可用中文字体，已跳过")
             return None
         escaped_text_fontfile = self._escape_drawtext_value(text_fontfile)
         self._log(
-            "订阅提示：已启用（左下角，圆角红色标签，每10秒出现5秒）"
+            "订阅提示：已启用（左下角，放大加粗字体并以最低点贴底显示，每10秒出现5秒）"
             f" 透明度={subscribe_prompt_opacity}%"
         )
         badge = self._create_subscribe_prompt_badge(
@@ -2414,7 +2424,10 @@ class SubtitleBurnerApp:
         if not badge:
             self._log("订阅提示：圆角底板生成失败，回退普通矩形底板。")
             prompt_alpha = self._opacity_percent_to_drawtext_alpha(subscribe_prompt_opacity)
-            y_expr = f"h-th-{margin_y}+{float_amplitude}*sin(2*PI*t/2.4)"
+            y_expr = (
+                f"h-th-{safe_bottom_offset}"
+                f"+{float_amplitude}*sin(2*PI*t/2.4)"
+            )
             text_filter = (
                 "drawtext="
                 f"text='{escaped_text}':"
@@ -2422,8 +2435,8 @@ class SubtitleBurnerApp:
                 "expansion=none:"
                 f"fontsize={fontsize}:"
                 "fontcolor=white@0.98:"
-                "borderw=1.0:"
-                "bordercolor=white@0.22:"
+                "borderw=1.2:"
+                "bordercolor=white@0.26:"
                 "box=1:"
                 f"boxcolor=red@{prompt_alpha}:"
                 "boxborderw=14:"
@@ -2440,14 +2453,14 @@ class SubtitleBurnerApp:
         text_area_width = int(badge["text_area_width"])
         text_x = f"{margin_x + text_area_x}+({text_area_width}-tw)/2"
         text_y = (
-            f"h-{badge_height}-{margin_y}+({badge_height}-th)/2"
+            f"h-{badge_height}-{safe_bottom_offset}+({badge_height}-th)/2"
             f"+{float_amplitude}*sin(2*PI*t/2.4)"
         )
         badge_filter = (
             f"movie='{badge_path}',format=rgba[subscribe_badge];"
             f"[{{input_label}}][subscribe_badge]overlay="
             f"x={margin_x}:"
-            f"y=H-h-{margin_y}+{float_amplitude}*sin(2*PI*t/2.4):"
+            f"y=H-h-{safe_bottom_offset}+{float_amplitude}*sin(2*PI*t/2.4):"
             f"enable='{enable_expr}'[{{output_label}}]"
         )
         text_filter = (
@@ -2457,8 +2470,8 @@ class SubtitleBurnerApp:
             "expansion=none:"
             f"fontsize={fontsize}:"
             "fontcolor=white@0.98:"
-            "borderw=0.8:"
-            "bordercolor=black@0.14:"
+            "borderw=1.05:"
+            "bordercolor=black@0.18:"
             f"x={text_x}:"
             f"y={text_y}:"
             f"enable='{enable_expr}'"
